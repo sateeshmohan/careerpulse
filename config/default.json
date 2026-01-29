@@ -4,9 +4,9 @@
         "level": "debug",
         "path": ""
     },
-    "redis_uri": "redis://appuser:strongpassword@104.251.217.22:6379",
-    "redis_uri_lookup": "redis://appuser:strongpassword@104.251.217.22:6379/15",
-    "redis_uri_expire": "redis://appuser:strongpassword@104.251.217.22:6379/2",
+    "redis_uri": "redis://appuser:strongpassword@104.251.217.22:6379/1",
+    "redis_uri_lookup": "redis://appuser:strongpassword@104.251.217.22:6379/2",
+    "redis_uri_expire": "redis://appuser:strongpassword@104.251.217.22:6379/3",
     "mongodb": {
         "uri": "mongodb://mohan:CypriaCuteyZimmyCarts@104.251.217.22:27017/admin",
         "database": "careerlinkfinder_prod",
