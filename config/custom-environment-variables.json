@@ -1,0 +1,253 @@
+{
+    "name": "PROJECT_NAME",
+    "log": {
+        "level": "LOG_LEVEL",
+        "path": "LOG_PATH"
+    },
+    "redis_uri": "REDIS_URI",
+    "redis_uri_lookup": "REDIS_URI_LOOKUP",
+    "redis_uri_expire": "REDIS_URI_EXPIRE",
+    "mongodb": {
+        "uri": "MONGODB_URI",
+        "database": "MONGODB_DATABSAE",
+        "collection": "MONGODB_COLLECTION",
+        "import_collection": "IMPORT_COLLECTION",
+        "big_bucket_import_collection": "BIG_BUCKET_IMPORT_COLLECTION",
+        "p1_out": "P1_OUTPUT_COLLECTION",
+        "p2_out": "P2_OUTPUT_COLLECTION",
+        "p3_out": "P3_OUTPUT_COLLECTION",
+        "p3_output_collection": "P3_OUTPUT_COLLECTION_DB"
+    },
+    "pagecheck_model": "PAGECHECK_MODEL",
+    "p1p2p3_version": "P1P2P3_VERSION",
+    "bigml_ami": "BIGML_AMI",
+    "here_api_keys": "HERE_API_KEYS",
+    "group1_testing": "GROUP1_TESTING",
+    "aws_instance": "AWS_INSTANCE",
+    "host_max_requests": "HOST_MAX_REQUESTS",
+    "rate_limiter_duration": "RATE_LIMITER_DURATION",
+    "custom_limitation": "CUSTOM_LIMITATION",
+    "max_no_clicks": "MAX_NO_CLICKS",
+    "max_no_clicks_status": "MAX_NO_CLICKS_STATUS",
+    "batch_id": "BATCH_ID",
+    "enable_pagecheck": "ENABLE_PAGECHECK",
+    "enable_single_page": "ENABLE_SINGLE_PAGE",
+    "queues": {
+        "sites": {
+            "concurrency": {
+                "__name": "SITES_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "SITES_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "SITES_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "SITES_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "SITES_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "SITES_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            },
+            "repeatEvery": {
+                "__name": "SITES_QUEUE_REPEAT_JOB_EVERY",
+                "__format": "json"
+            }
+        },
+        "sites_with_patterns": {
+            "concurrency": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            },
+            "repeatEvery": {
+                "__name": "SITES_WITH_PATTERNS_QUEUE_REPEAT_JOB_EVERY",
+                "__format": "json"
+            }
+        },
+        "testing_patterns": {
+            "concurrency": {
+                "__name": "TESTING_PATTERNS_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "TESTING_PATTERNS_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "TESTING_PATTERNS_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "TESTING_PATTERNS_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "TESTING_PATTERNS_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "TESTING_PATTERNS_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            },
+            "repeatEvery": {
+                "__name": "TESTING_PATTERNS_QUEUE_REPEAT_JOB_EVERY",
+                "__format": "json"
+            }
+        },
+        "testing_urls": {
+            "concurrency": {
+                "__name": "TESTING_URLS_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "TESTING_URLS_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "TESTING_URLS_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "TESTING_URLS_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "TESTING_URLS_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "TESTING_URLS_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            }
+        },
+        "urls": {
+            "concurrency": {
+                "__name": "URLS_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "URLS_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "URLS_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "URLS_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "URLS_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "URLS_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            }
+        },
+        "job_urls": {
+            "concurrency": {
+                "__name": "JOB_URLS_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "JOB_URLS_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "JOB_URLS_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "JOB_URLS_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "JOB_URLS_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "JOB_URLS_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            }
+        },
+        "jobs": {
+            "concurrency": {
+                "__name": "JOBS_QUEUE_CONCURRENCY",
+                "__format": "json"
+            },
+            "attempts": {
+                "__name": "JOBS_QUEUE_ATTEMPTS",
+                "__format": "json"
+            },
+            "lockDuration": {
+                "__name": "JOBS_QUEUE_LOCK_DURATION",
+                "__format": "json"
+            },
+            "stalledInterval": {
+                "__name": "JOBS_QUEUE_STALLED_INTERVAL",
+                "__format": "json"
+            },
+            "guardInterval": {
+                "__name": "JOBS_QUEUE_GUARD_INTERVAL",
+                "__format": "json"
+            },
+            "backoffDelay": {
+                "__name": "JOBS_QUEUE_BACKOFF_DELAY",
+                "__format": "json"
+            }
+        }
+    },
+    "browser": {
+        "concurrency": {
+            "__name": "MAX_NO_PAGES",
+            "__format": "json"
+        },
+        "timeout": {
+            "__name": "PAGE_TIMEOUT",
+            "__format": "json"
+        }
+    },
+    "HCS": {
+        "servers": "SERVERS",
+        "ports": "PORTS"
+    },
+    "BIGML": {
+        "endpoint": "BIGML_ENDPOINT",
+        "diffbot_env": "DIFFBOT_ENV",
+        "include": {
+            "jobdesc": "BIGML_JOBDESC_INCLUDE"
+        },
+        "jobdesc_endpoint": "BIGML_JOBDESC_ENDPOINT"
+    }
+}

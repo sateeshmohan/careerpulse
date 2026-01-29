@@ -1,0 +1,21 @@
+{
+  "name": "careerlinkfinder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "pipeline/index.js",
+  "scripts": {
+    "seed": "node pipeline/index.js seed",
+    "worker:links": "node pipeline/index.js worker:links",
+    "worker:html": "node pipeline/index.js worker:html"
+  },
+  "dependencies": {
+    "config": "^3.3.9",
+    "got": "^11.8.6",
+    "keyfinder": "^1.0.0",
+    "mongodb": "^6.5.0",
+    "puppeteer": "^22.6.4",
+    "redis": "^4.6.13",
+    "valid-url": "^1.0.9"
+  }
+}

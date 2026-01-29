@@ -1,0 +1,91 @@
+{
+    "log": {
+        "level": "error"
+    },
+    "redis_uri": "redis://appuser:strongpassword@104.251.217.22:6379",
+    "mongodb": {
+        "uri": "mongodb://mohan:CypriaCuteyZimmyCarts@104.251.217.22:27017/admin",
+        "database": "careerlinkfinder_prod",
+        "collection": "test",
+        "import_collection": "test",
+        "big_bucket_import_collection": "Big_Bucket_Import_Collection",
+        "p1_out": "P1_OUTPUT_COLLECTION",
+        "p2_out": "P2_OUTPUT_COLLECTION",
+        "p3_out": "P3_OUTPUT_COLLECTION",
+        "p3_output_collection": "P3_Output_Master"
+    },
+    "queues": {
+        "sites": {
+            "concurrency": 1,
+            "attempts": 5,
+            "lockDuration": 600000,
+            
+            "stalledInterval": 600000,
+            "guardInterval": 5000,
+            "backoffDelay": 600000,
+            "repeatJobEvery": 86400000
+        },
+        "sites_with_patterns": {
+            "concurrency": 1,
+            "attempts": 5,
+            "lockDuration": 600000,
+            
+            "stalledInterval": 600000,
+            "guardInterval": 5000,
+            "backoffDelay": 600000,
+            "repeatJobEvery": 86400000
+        },
+        "testing_patterns": {
+            "concurrency": 1,
+            "attempts": 5,
+            "lockDuration": 600000,
+            
+            "stalledInterval": 600000,
+            "guardInterval": 5000,
+            "backoffDelay": 600000
+        },
+        "testing_urls": {
+            "concurrency": 1,
+            "attempts": 5,
+            "lockDuration": 600000,
+            
+            "stalledInterval": 600000,
+            "guardInterval": 5000,
+            "backoffDelay": 600000
+        },
+        "urls": {
+            "concurrency": 1,
+            "attempts": 3,
+            "lockDuration": 600000,
+            
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 600000
+        },
+        "job_urls": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 300000,
+            
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 300000
+        },
+        "jobs": {
+            "concurrency": 1,
+            "attempts": 3,
+            "lockDuration": 600000,
+            
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 600000
+        }
+    },
+    "browser": {
+        "maxPages": 20,
+        "timeout": 432000000,
+        "options": {
+            "headless": true
+        }
+    }
+}

@@ -1,0 +1,197 @@
+{
+    "name": "P1P2P3",
+    "log": {
+        "level": "debug",
+        "path": ""
+    },
+    "redis_uri": "redis://appuser:strongpassword@104.251.217.22:6379",
+    "redis_uri_lookup": "redis://appuser:strongpassword@104.251.217.22:6379/15",
+    "redis_uri_expire": "redis://appuser:strongpassword@104.251.217.22:6379/2",
+    "mongodb": {
+        "uri": "mongodb://mohan:CypriaCuteyZimmyCarts@104.251.217.22:27017/admin",
+        "database": "careerlinkfinder_prod",
+        "collection": "newdata",
+        "import_collection": "newdata",
+        "big_bucket_import_collection": "Big_Bucket_Import_Collection",
+        "p1_out": "P1_OUTPUT_COLLECTION",
+        "p2_out": "P2_OUTPUT_COLLECTION",
+        "p3_out": "P3_OUTPUT_COLLECTION",
+        "p3_output_collection": "P3_Output_Master"
+    },
+    "pagecheck_model": "PAGECHECK_MODEL",
+    "p1p2p3_version": "P1P2P3_VERSION",
+    "bigml_ami": "BIGML_AMI",
+    "here_api_keys": [
+        "wMR68EarJM4z9_syevVVeFwqKal0PszDPZDKkpFnBh4",
+        "m-pgweT9MUkzMyiuyeGoPeEMJem8eLpIhZcq0DATzTc",
+        "FVJTkVpVhxW1AqODFEXXs_AmT-oKD8e60Iz8LSA_zSU",
+        "NuDMtYZy6kb6SEEB1AyJA6A2V8hGjy8Ez-b3c7ybWog"
+    ],
+    "group1_testing": true,
+    "aws_instance": false,
+    "host_max_requests": 1,
+    "rate_limiter_duration": 10,
+    "custom_limitation": false,
+    "max_no_clicks": 100,
+    "max_no_clicks_status": true,
+    "batch_id": "Batch-1",
+    "enable_pagecheck": true,
+    "enable_single_page": false,
+    "queues": {
+        "sites": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000,
+            "repeatJobEvery": 86400000
+        },
+        "sites_with_patterns": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000,
+            "repeatJobEvery": 86400000
+        },
+        "testing_patterns": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000
+        },
+        "testing_urls": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000
+        },
+        "urls": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000
+        },
+        "job_urls": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000
+        },
+        "jobs": {
+            "concurrency": 1,
+            "attempts": 2,
+            "lockDuration": 900000,
+            "stalledInterval": 5000,
+            "guardInterval": 5000,
+            "backoffDelay": 10000
+        }
+    },
+    "pipeline": {
+        "queues": {
+            "career_pages": "career:pages",
+            "career_links": "career:links",
+            "career_links_dedupe": "career:links:dedupe"
+        },
+        "collections": {
+            "career_pages": "career_pages",
+            "career_links": "career_links",
+            "job_html": "career_html"
+        },
+        "same_domain_only": true,
+        "min_links_for_got": 5,
+        "min_html_length": 1000,
+        "got_timeout_ms": 20000,
+        "puppeteer_timeout_ms": 60000,
+        "poll_timeout_seconds": 5,
+        "job_link_strong_patterns": [
+            "jobid=",
+            "job_id=",
+            "jid=",
+            "gh_jid=",
+            "req=",
+            "requisition",
+            "jobdetail",
+            "jobdetails",
+            "job-detail",
+            "job-details",
+            "jobdescription",
+            "job-description",
+            "job_desc",
+            "apply?job",
+            "apply/job",
+            "apply?jid"
+        ],
+        "job_link_weak_patterns": [
+            "/job/",
+            "/jobs/",
+            "/career/",
+            "/careers/",
+            "/position/",
+            "/positions/",
+            "/opening/",
+            "/openings/",
+            "/opportunity/",
+            "/opportunities/",
+            "/posting",
+            "/apply"
+        ],
+        "job_link_exclude_patterns": [
+            "privacy",
+            "terms",
+            "cookies",
+            "accessibility",
+            "benefits",
+            "about",
+            "news",
+            "blog",
+            "press",
+            "investor",
+            "sustainability",
+            "location",
+            "locations",
+            "contact",
+            "support",
+            "faq",
+            "login",
+            "signin",
+            "signup",
+            "register",
+            "policy",
+            "mailto:",
+            "tel:",
+            "javascript:",
+            "search?",
+            "search/"
+        ]
+    },
+    "browser": {
+        "maxPages": 10,
+        "timeout": 432000000,
+        "options": {
+            "args": [
+                "--no-sandbox",
+                "--lang=en-GB,en",
+                "--disable-setuid-sandbox",
+                "--disable-web-security",
+                "--disable-infobars",
+                "--window-position=0,0",
+                "--ignore-certifcate-errors",
+                "--ignore-certifcate-errors-spki-list",
+                "--window-size=1366,768"
+            ],
+            "headless": true,
+            "ignoreHTTPSErrors": true
+        }
+    }
+}
