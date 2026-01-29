@@ -148,7 +148,16 @@ function parseArgs(argv) {
 function normalizeLink(link) {
   try {
     const urlObj = new URL(link);
-    urlObj.hash = "";
+    const hash = urlObj.hash || "";
+    const lowerHash = hash.toLowerCase();
+    const hashLooksLikeJobRoute =
+      (lowerHash.startsWith("#/") || lowerHash.startsWith("#!")) &&
+      /#(\/|!\/)(job|jobs|career|careers|position|positions|opening|openings|opportunity|opportunities|posting|apply)\b/.test(
+        lowerHash
+      );
+    if (!hashLooksLikeJobRoute) {
+      urlObj.hash = "";
+    }
     return urlObj.toString();
   } catch (error) {
     return link;
@@ -185,6 +194,39 @@ function applySocialMediaFilter(links, baseUrl) {
   const dataset = links.map((url) => ({ url }));
   const filtered = deleteSocialMediaUrls(dataset, domain);
   return filtered.map((item) => item.url).filter(Boolean);
+}
+
+function parseQueueItem(value) {
+  if (!value || typeof value !== "string") {
+    return { url: value };
+  }
+  const trimmed = value.trim();
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) {
+    return { url: value };
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      const url = parsed.url || parsed.link || parsed.jobUrl;
+      if (url) {
+        return {
+          url,
+          careerUrl: parsed.careerUrl || parsed.career_url
+        };
+      }
+    }
+  } catch (error) {
+    return { url: value };
+  }
+  return { url: value };
+}
+
+function buildJobUpdate(url, careerUrl, extraFields) {
+  const update = { url, ...extraFields };
+  if (careerUrl) {
+    update.careerUrl = careerUrl;
+  }
+  return update;
 }
 
 async function fetchCareerLinks(url) {
@@ -335,11 +377,13 @@ async function runLinksWorker(args) {
         );
 
         for (const link of jobLinks) {
+          const payload = JSON.stringify({ url: link, careerUrl: url });
           await saddAndQueue(
             redisClient,
             queues.careerLinksDedup,
             queues.careerLinks,
-            link
+            link,
+            payload
           );
         }
 
@@ -392,41 +436,50 @@ async function runHtmlWorker(args) {
 
   try {
     while (true) {
-      const url = await blpop(redisClient, queues.careerLinks, settings.pollTimeoutSeconds);
-      if (!url) {
+      const queueItem = await blpop(
+        redisClient,
+        queues.careerLinks,
+        settings.pollTimeoutSeconds
+      );
+      if (!queueItem) {
         if (args.once) {
           break;
         }
         continue;
       }
 
+      const { url: jobUrl, careerUrl } = parseQueueItem(queueItem);
+      if (!jobUrl) {
+        continue;
+      }
       const startedAt = new Date();
       const isJobLink =
-        filterJobLinks([url], {
+        filterJobLinks([jobUrl], {
           strongPatterns: settings.jobLinkStrongPatterns,
           weakPatterns: settings.jobLinkWeakPatterns,
           excludePatterns: settings.jobLinkExcludePatterns
         }).length > 0;
       if (!isJobLink) {
         await collection.updateOne(
-          { url },
+          { url: jobUrl },
           {
             $set: {
-              url,
-              html: "",
-              skipped: true,
-              skipReason: "non_job_link",
-              fetchedAt: new Date(),
-              startedAt
+              ...buildJobUpdate(jobUrl, careerUrl, {
+                html: "",
+                skipped: true,
+                skipReason: "non_job_link",
+                fetchedAt: new Date(),
+                startedAt
+              })
             }
           },
           { upsert: true }
         );
-        log("Skipped non-job link.", { url });
+        log("Skipped non-job link.", { url: jobUrl });
         continue;
       }
       try {
-        const { html, source, userAgent } = await fetchPageHtml(url);
+        const { html, source, userAgent } = await fetchPageHtml(jobUrl);
         const { rawBlocks, jobPosting } = extractJobPostingFromHtml(html);
         let parsedLdJson = null;
         if (jobPosting) {
@@ -437,39 +490,41 @@ async function runHtmlWorker(args) {
           }
         }
         await collection.updateOne(
-          { url },
+          { url: jobUrl },
           {
             $set: {
-              url,
-              // html,
-              source,
-              userAgent,
-              ldjsonRaw: jobPosting,
-              ldjsonParsed: parsedLdJson,
-              ldjsonBlocks: rawBlocks,
-              fetchedAt: new Date(),
-              startedAt
+              ...buildJobUpdate(jobUrl, careerUrl, {
+                // html,
+                source,
+                userAgent,
+                ldjsonRaw: jobPosting,
+                ldjsonParsed: parsedLdJson,
+                ldjsonBlocks: rawBlocks,
+                fetchedAt: new Date(),
+                startedAt
+              })
             }
           },
           { upsert: true }
         );
         processed += 1;
-        log("HTML fetched.", { url, source, length: html.length });
+        log("HTML fetched.", { url: jobUrl, source, length: html.length });
       } catch (error) {
         await collection.updateOne(
-          { url },
+          { url: jobUrl },
           {
             $set: {
-              url,
-              html: "",
-              error: error.toString(),
-              fetchedAt: new Date(),
-              startedAt
+              ...buildJobUpdate(jobUrl, careerUrl, {
+                html: "",
+                error: error.toString(),
+                fetchedAt: new Date(),
+                startedAt
+              })
             }
           },
           { upsert: true }
         );
-        log("Error fetching HTML.", { url, error: error.toString() });
+        log("Error fetching HTML.", { url: jobUrl, error: error.toString() });
       }
 
       if (args.max && processed >= args.max) {

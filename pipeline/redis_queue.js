@@ -18,10 +18,10 @@ async function rpush(client, key, value) {
   await client.rPush(key, value);
 }
 
-async function saddAndQueue(client, setKey, queueKey, value) {
+async function saddAndQueue(client, setKey, queueKey, value, queueValue = value) {
   const added = await client.sAdd(setKey, value);
   if (added) {
-    await client.rPush(queueKey, value);
+    await client.rPush(queueKey, queueValue);
   }
   return added;
 }
