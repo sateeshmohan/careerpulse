@@ -10,7 +10,15 @@ const {
   fetchHtmlWithPuppeteer,
   closeBrowser
 } = require("./puppeteer_client");
-const { createRedisClient, blpop, rpush, saddAndQueue } = require("./redis_queue");
+const {
+  createRedisClient,
+  ensureStreamGroup,
+  streamAdd,
+  streamReadGroup,
+  streamAutoClaimOne,
+  streamAck,
+  saddAndStream
+} = require("./redis_queue");
 const { connectMongo } = require("./mongo_client");
 const { extractJobPostingFromHtml } = require("./ldjson_extractor");
 const parseLdJson = require("../ldjson_parser");
@@ -78,26 +86,26 @@ const settings = {
   ),
   minLinksForGot: Number(
     process.env.MIN_GOT_LINKS ||
-      pipelineConfig.min_links_for_got ||
-      5
+    pipelineConfig.min_links_for_got ||
+    5
   ),
   minHtmlLength: Number(
     process.env.MIN_HTML_LENGTH ||
-      pipelineConfig.min_html_length ||
-      1000
+    pipelineConfig.min_html_length ||
+    1000
   ),
   gotTimeoutMs: Number(
     process.env.GOT_TIMEOUT_MS || pipelineConfig.got_timeout_ms || 20000
   ),
   puppeteerTimeoutMs: Number(
     process.env.PUPPETEER_TIMEOUT_MS ||
-      pipelineConfig.puppeteer_timeout_ms ||
-      60000
+    pipelineConfig.puppeteer_timeout_ms ||
+    60000
   ),
   pollTimeoutSeconds: Number(
     process.env.POLL_TIMEOUT_SECONDS ||
-      pipelineConfig.poll_timeout_seconds ||
-      5
+    pipelineConfig.poll_timeout_seconds ||
+    5
   ),
   jobLinkStrongPatterns:
     pipelineConfig.job_link_strong_patterns ||
@@ -116,6 +124,41 @@ const settings = {
       : undefined)
 };
 
+const streamConfig = pipelineConfig.streams || {};
+const streamGroups = {
+  careerPages:
+    process.env.CAREER_PAGES_GROUP ||
+    (streamConfig.groups && streamConfig.groups.career_pages) ||
+    "career-pages",
+  careerLinks:
+    process.env.CAREER_LINKS_GROUP ||
+    (streamConfig.groups && streamConfig.groups.career_links) ||
+    "career-links"
+};
+const streamSettings = {
+  blockMs: Number(
+    process.env.STREAM_BLOCK_MS ||
+      streamConfig.block_ms ||
+      settings.pollTimeoutSeconds * 1000
+  ),
+  readCount: Number(
+    process.env.STREAM_READ_COUNT || streamConfig.read_count || 1
+  ),
+  claimMinIdleMs: Number(
+    process.env.STREAM_CLAIM_MIN_IDLE_MS ||
+      streamConfig.claim_min_idle_ms ||
+      60000
+  ),
+  claimCount: Number(
+    process.env.STREAM_CLAIM_COUNT || streamConfig.claim_count || 1
+  ),
+  claimIntervalMs: Number(
+    process.env.STREAM_CLAIM_INTERVAL_MS ||
+      streamConfig.claim_interval_ms ||
+      30000
+  )
+};
+
 function log(message, payload) {
   const ts = new Date().toISOString();
   if (payload) {
@@ -123,6 +166,11 @@ function log(message, payload) {
     return;
   }
   console.log(`[${ts}] ${message}`);
+}
+
+function buildConsumerName(prefix) {
+  const host = process.env.HOSTNAME || "worker";
+  return `${prefix}-${host}-${process.pid}`;
 }
 
 function parseArgs(argv) {
@@ -229,6 +277,39 @@ function buildJobUpdate(url, careerUrl, extraFields) {
   return update;
 }
 
+async function findAnyDocument(collection, query) {
+  const doc = await collection.findOne(query, { projection: { _id: 1 } });
+  return Boolean(doc);
+}
+
+async function selectSeedCollection(db, candidates, fieldName, markField) {
+  const uniqueCandidates = Array.from(
+    new Set((candidates || []).filter(Boolean))
+  );
+  if (!uniqueCandidates.length) {
+    return { name: null, reason: "no_candidates" };
+  }
+  const markFieldName = markField || "redisSeeded";
+  const baseQuery = { [fieldName]: { $exists: true, $ne: null } };
+  const unseededQuery = { ...baseQuery, [markFieldName]: { $ne: true } };
+
+  for (const name of uniqueCandidates) {
+    const collection = db.collection(name);
+    if (await findAnyDocument(collection, unseededQuery)) {
+      return { name, reason: "has_unseeded_docs" };
+    }
+  }
+
+  for (const name of uniqueCandidates) {
+    const collection = db.collection(name);
+    if (await findAnyDocument(collection, baseQuery)) {
+      return { name, reason: "field_present" };
+    }
+  }
+
+  return { name: uniqueCandidates[0], reason: "fallback" };
+}
+
 async function fetchCareerLinks(url) {
   let gotResult = null;
   try {
@@ -299,30 +380,118 @@ async function seedFromFile(redisClient, filePath) {
     .map((line) => line.trim())
     .filter(Boolean);
   for (const url of urls) {
-    await rpush(redisClient, queues.careerPages, url);
+    await streamAdd(redisClient, queues.careerPages, url);
   }
   log("Seeded urls from file.", { count: urls.length, queue: queues.careerPages });
 }
 
-async function seedFromMongo(redisClient, db, collectionName, fieldName) {
+async function seedFromMongo(redisClient, db, collectionName, fieldName, options = {}) {
+  const {
+    batchSize = 500,
+    max = 0,
+    markField = "redisSeeded",
+    markAtField = "redisSeededAt"
+  } = options;
+  const resolvedBatchSize = Number.isFinite(Number(batchSize)) ? Number(batchSize) : 500;
+  const safeBatchSize = resolvedBatchSize > 0 ? resolvedBatchSize : 500;
+  const resolvedMax = Number.isFinite(Number(max)) ? Number(max) : 0;
+  const safeMarkField = markField || "redisSeeded";
+  const safeMarkAtField = markAtField || "redisSeededAt";
   const collection = db.collection(collectionName);
-  const cursor = collection.find(
-    { [fieldName]: { $exists: true } },
-    { projection: { [fieldName]: 1 } }
-  );
-  let count = 0;
-  for await (const doc of cursor) {
-    const url = doc[fieldName];
-    if (!url) {
-      continue;
+  const query = {
+    [fieldName]: { $exists: true, $ne: null },
+    [safeMarkField]: { $ne: true }
+  };
+  const hasCandidate = await collection.findOne(query, { projection: { _id: 1 } });
+  if (!hasCandidate) {
+    const hasField = await collection.findOne(
+      { [fieldName]: { $exists: true, $ne: null } },
+      { projection: { _id: 1 } }
+    );
+    if (!hasField) {
+      log("No documents found with seed field.", {
+        collection: collectionName,
+        field: fieldName
+      });
+    } else {
+      log("No unseeded documents found.", {
+        collection: collectionName,
+        field: fieldName,
+        markField: safeMarkField
+      });
     }
-    await rpush(redisClient, queues.careerPages, url);
-    count += 1;
+    return;
   }
+  let cursor = collection.find(query, { projection: { [fieldName]: 1 } });
+  if (safeBatchSize > 0) {
+    cursor = cursor.batchSize(safeBatchSize);
+  }
+  if (resolvedMax > 0) {
+    cursor = cursor.limit(resolvedMax);
+  }
+
+  let count = 0;
+  let batch = [];
+
+  const flushBatch = async () => {
+    if (!batch.length) {
+      return;
+    }
+    const updates = [];
+    let pushed = 0;
+    for (const doc of batch) {
+      const url = doc[fieldName];
+      if (!url) {
+        continue;
+      }
+      try {
+        await streamAdd(redisClient, queues.careerPages, url);
+        updates.push({
+          updateOne: {
+            filter: { _id: doc._id },
+            update: {
+              $set: {
+                [safeMarkField]: true,
+                [safeMarkAtField]: new Date()
+              }
+            }
+          }
+        });
+        pushed += 1;
+      } catch (error) {
+        if (updates.length) {
+          await collection.bulkWrite(updates, { ordered: false });
+        }
+        throw error;
+      }
+    }
+    if (updates.length) {
+      await collection.bulkWrite(updates, { ordered: false });
+    }
+    count += pushed;
+    log("Seeded mongo batch.", {
+      batchCount: pushed,
+      totalCount: count,
+      queue: queues.careerPages,
+      collection: collectionName
+    });
+    batch = [];
+  };
+
+  for await (const doc of cursor) {
+    batch.push(doc);
+    if (safeBatchSize > 0 && batch.length >= safeBatchSize) {
+      await flushBatch();
+    }
+  }
+  await flushBatch();
+
   log("Seeded urls from mongo.", {
     count,
     queue: queues.careerPages,
-    collection: collectionName
+    collection: collectionName,
+    markField: safeMarkField,
+    markAtField: safeMarkAtField
   });
 }
 
@@ -333,15 +502,79 @@ async function runLinksWorker(args) {
     mongoConfig.database
   );
   const collection = db.collection(collections.careerLinks);
+  const consumer = buildConsumerName("links");
+  await ensureStreamGroup(
+    redisClient,
+    queues.careerPages,
+    streamGroups.careerPages
+  );
+  await ensureStreamGroup(
+    redisClient,
+    queues.careerLinks,
+    streamGroups.careerLinks
+  );
   let processed = 0;
+  let claimStartId = "0-0";
+  let lastClaimAt = 0;
 
   try {
     while (true) {
-      const url = await blpop(redisClient, queues.careerPages, settings.pollTimeoutSeconds);
-      if (!url) {
+      let message = null;
+      if (
+        streamSettings.claimMinIdleMs > 0 &&
+        streamSettings.claimIntervalMs > 0
+      ) {
+        const now = Date.now();
+        if (now - lastClaimAt >= streamSettings.claimIntervalMs) {
+          lastClaimAt = now;
+          const claimResult = await streamAutoClaimOne(
+            redisClient,
+            queues.careerPages,
+            streamGroups.careerPages,
+            consumer,
+            streamSettings.claimMinIdleMs,
+            claimStartId,
+            streamSettings.claimCount
+          );
+          if (claimResult) {
+            claimStartId = claimResult.nextId || claimStartId;
+            message = claimResult.message;
+          }
+        }
+      }
+      if (!message) {
+        message = await streamReadGroup(
+          redisClient,
+          queues.careerPages,
+          streamGroups.careerPages,
+          consumer,
+          streamSettings.blockMs,
+          streamSettings.readCount
+        );
+      }
+      if (!message) {
         if (args.once) {
           break;
         }
+        continue;
+      }
+      if (!message.value) {
+        await streamAck(
+          redisClient,
+          queues.careerPages,
+          streamGroups.careerPages,
+          message.id
+        );
+        continue;
+      }
+      const url = message.value;
+      if (!url) {
+        await streamAck(
+          redisClient,
+          queues.careerPages,
+          streamGroups.careerPages,
+          message.id
+        );
         continue;
       }
 
@@ -378,7 +611,7 @@ async function runLinksWorker(args) {
 
         for (const link of jobLinks) {
           const payload = JSON.stringify({ url: link, careerUrl: url });
-          await saddAndQueue(
+          await saddAndStream(
             redisClient,
             queues.careerLinksDedup,
             queues.careerLinks,
@@ -412,6 +645,13 @@ async function runLinksWorker(args) {
           { upsert: true }
         );
         log("Error fetching career links.", { url, error: error.toString() });
+      } finally {
+        await streamAck(
+          redisClient,
+          queues.careerPages,
+          streamGroups.careerPages,
+          message.id
+        );
       }
 
       if (args.max && processed >= args.max) {
@@ -432,53 +672,102 @@ async function runHtmlWorker(args) {
     mongoConfig.database
   );
   const collection = db.collection(collections.jobHtml);
+  const consumer = buildConsumerName("html");
+  await ensureStreamGroup(
+    redisClient,
+    queues.careerLinks,
+    streamGroups.careerLinks
+  );
   let processed = 0;
+  let claimStartId = "0-0";
+  let lastClaimAt = 0;
 
   try {
     while (true) {
-      const queueItem = await blpop(
-        redisClient,
-        queues.careerLinks,
-        settings.pollTimeoutSeconds
-      );
-      if (!queueItem) {
+      let message = null;
+      if (
+        streamSettings.claimMinIdleMs > 0 &&
+        streamSettings.claimIntervalMs > 0
+      ) {
+        const now = Date.now();
+        if (now - lastClaimAt >= streamSettings.claimIntervalMs) {
+          lastClaimAt = now;
+          const claimResult = await streamAutoClaimOne(
+            redisClient,
+            queues.careerLinks,
+            streamGroups.careerLinks,
+            consumer,
+            streamSettings.claimMinIdleMs,
+            claimStartId,
+            streamSettings.claimCount
+          );
+          if (claimResult) {
+            claimStartId = claimResult.nextId || claimStartId;
+            message = claimResult.message;
+          }
+        }
+      }
+      if (!message) {
+        message = await streamReadGroup(
+          redisClient,
+          queues.careerLinks,
+          streamGroups.careerLinks,
+          consumer,
+          streamSettings.blockMs,
+          streamSettings.readCount
+        );
+      }
+      if (!message) {
         if (args.once) {
           break;
         }
         continue;
       }
-
-      const { url: jobUrl, careerUrl } = parseQueueItem(queueItem);
-      if (!jobUrl) {
-        continue;
-      }
-      const startedAt = new Date();
-      const isJobLink =
-        filterJobLinks([jobUrl], {
-          strongPatterns: settings.jobLinkStrongPatterns,
-          weakPatterns: settings.jobLinkWeakPatterns,
-          excludePatterns: settings.jobLinkExcludePatterns
-        }).length > 0;
-      if (!isJobLink) {
-        await collection.updateOne(
-          { url: jobUrl },
-          {
-            $set: {
-              ...buildJobUpdate(jobUrl, careerUrl, {
-                html: "",
-                skipped: true,
-                skipReason: "non_job_link",
-                fetchedAt: new Date(),
-                startedAt
-              })
-            }
-          },
-          { upsert: true }
+      if (!message.value) {
+        await streamAck(
+          redisClient,
+          queues.careerLinks,
+          streamGroups.careerLinks,
+          message.id
         );
-        log("Skipped non-job link.", { url: jobUrl });
         continue;
       }
+
+      const startedAt = new Date();
+      let jobUrl = null;
+      let careerUrl = null;
       try {
+        const parsed = parseQueueItem(message.value);
+        jobUrl = parsed.url;
+        careerUrl = parsed.careerUrl;
+        if (!jobUrl) {
+          continue;
+        }
+        const isJobLink =
+          filterJobLinks([jobUrl], {
+            strongPatterns: settings.jobLinkStrongPatterns,
+            weakPatterns: settings.jobLinkWeakPatterns,
+            excludePatterns: settings.jobLinkExcludePatterns
+          }).length > 0;
+        if (!isJobLink) {
+          await collection.updateOne(
+            { url: jobUrl },
+            {
+              $set: {
+                ...buildJobUpdate(jobUrl, careerUrl, {
+                  html: "",
+                  skipped: true,
+                  skipReason: "non_job_link",
+                  fetchedAt: new Date(),
+                  startedAt
+                })
+              }
+            },
+            { upsert: true }
+          );
+          log("Skipped non-job link.", { url: jobUrl });
+          continue;
+        }
         const { html, source, userAgent } = await fetchPageHtml(jobUrl);
         const { rawBlocks, jobPosting } = extractJobPostingFromHtml(html);
         let parsedLdJson = null;
@@ -510,11 +799,12 @@ async function runHtmlWorker(args) {
         processed += 1;
         log("HTML fetched.", { url: jobUrl, source, length: html.length });
       } catch (error) {
+        const fallbackUrl = jobUrl || message.value;
         await collection.updateOne(
-          { url: jobUrl },
+          { url: fallbackUrl },
           {
             $set: {
-              ...buildJobUpdate(jobUrl, careerUrl, {
+              ...buildJobUpdate(fallbackUrl, careerUrl, {
                 html: "",
                 error: error.toString(),
                 fetchedAt: new Date(),
@@ -524,7 +814,14 @@ async function runHtmlWorker(args) {
           },
           { upsert: true }
         );
-        log("Error fetching HTML.", { url: jobUrl, error: error.toString() });
+        log("Error fetching HTML.", { url: fallbackUrl, error: error.toString() });
+      } finally {
+        await streamAck(
+          redisClient,
+          queues.careerLinks,
+          streamGroups.careerLinks,
+          message.id
+        );
       }
 
       if (args.max && processed >= args.max) {
@@ -545,7 +842,8 @@ async function main() {
   if (!command) {
     console.log("Usage:");
     console.log("  node pipeline/index.js seed --file <path>");
-    console.log("  node pipeline/index.js seed --collection <name> --field <field>");
+    console.log("  node pipeline/index.js seed --collection <name> --field <field> [--batch-size <n>] [--max <n>]");
+    console.log("                             [--mark-field <name>] [--mark-at-field <name>]");
     console.log("  node pipeline/index.js worker:links [--once] [--max <n>]");
     console.log("  node pipeline/index.js worker:html [--once] [--max <n>]");
     process.exit(1);
@@ -554,11 +852,36 @@ async function main() {
   if (command === "seed") {
     const redisClient = await createRedisClient(redisUrl);
     const filePath = args.file;
-    const collectionName =
-      args.collection || mongoConfig.import_collection || collections.careerPages;
+    const explicitCollectionName = args.collection;
+    const fallbackCollections = [
+      mongoConfig.import_collection,
+      collections.careerPages
+    ];
     const fieldName = args.field || "careerUrl";
+    const batchSize = Number(
+      args["batch-size"] ||
+      args.batchSize ||
+      (pipelineConfig.seed && pipelineConfig.seed.batch_size) ||
+      500
+    );
+    const max = Number(args.max || (pipelineConfig.seed && pipelineConfig.seed.max) || 0);
+    const markField =
+      args["mark-field"] ||
+      args.markField ||
+      (pipelineConfig.seed && pipelineConfig.seed.mark_field) ||
+      "redisSeeded";
+    const markAtField =
+      args["mark-at-field"] ||
+      args.markAtField ||
+      (pipelineConfig.seed && pipelineConfig.seed.mark_at_field) ||
+      "redisSeededAt";
 
     try {
+      await ensureStreamGroup(
+        redisClient,
+        queues.careerPages,
+        streamGroups.careerPages
+      );
       if (filePath) {
         await seedFromFile(redisClient, filePath);
       } else {
@@ -567,7 +890,37 @@ async function main() {
           mongoConfig.database
         );
         try {
-          await seedFromMongo(redisClient, db, collectionName, fieldName);
+          let collectionName = explicitCollectionName;
+          if (!collectionName) {
+            const selection = await selectSeedCollection(
+              db,
+              fallbackCollections,
+              fieldName,
+              markField
+            );
+            collectionName = selection.name || fallbackCollections[0];
+            log("Selected seed collection.", {
+              collection: collectionName,
+              reason: selection.reason
+            });
+          }
+          if (!collectionName) {
+            throw new Error("No mongo collection available for seeding.");
+          }
+          log("Seed settings.", {
+            collection: collectionName,
+            field: fieldName,
+            batchSize,
+            max,
+            markField,
+            markAtField
+          });
+          await seedFromMongo(redisClient, db, collectionName, fieldName, {
+            batchSize,
+            max,
+            markField,
+            markAtField
+          });
         } finally {
           await mongoClient.close();
         }
