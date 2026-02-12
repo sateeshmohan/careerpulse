@@ -13,11 +13,11 @@ const {
 const {
   createRedisClient,
   ensureStreamGroup,
-  streamAdd,
+  streamAddBatch,
   streamReadGroup,
   streamAutoClaimOne,
   streamAck,
-  saddAndStream
+  saddAndStreamBatch
 } = require("./redis_queue");
 const { connectMongo } = require("./mongo_client");
 const { extractJobPostingFromHtml } = require("./ldjson_extractor");
@@ -67,7 +67,11 @@ const collections = {
   jobHtml:
     process.env.JOB_HTML_COLLECTION ||
     (pipelineConfig.collections && pipelineConfig.collections.job_html) ||
-    "career_html"
+    "career_html",
+  jobLinks:
+    process.env.JOB_LINKS_COLLECTION ||
+    (pipelineConfig.collections && pipelineConfig.collections.job_links) ||
+    "career_link_jobs"
 };
 
 const parseBoolean = (value, fallback) => {
@@ -121,7 +125,56 @@ const settings = {
     pipelineConfig.job_link_exclude_patterns ||
     (process.env.JOB_LINK_EXCLUDE_PATTERNS
       ? process.env.JOB_LINK_EXCLUDE_PATTERNS.split("|")
-      : undefined)
+      : undefined),
+  enqueueHtmlFromLinksWorker: parseBoolean(
+    process.env.ENQUEUE_HTML_FROM_LINKS_WORKER,
+    pipelineConfig.enqueue_html_from_links_worker !== undefined
+      ? pipelineConfig.enqueue_html_from_links_worker
+      : false
+  ),
+  preserveLinksOnError: parseBoolean(
+    process.env.PRESERVE_LINKS_ON_ERROR,
+    pipelineConfig.preserve_links_on_error !== undefined
+      ? pipelineConfig.preserve_links_on_error
+      : true
+  ),
+  mergeLinksAcrossRuns: parseBoolean(
+    process.env.MERGE_LINKS_ACROSS_RUNS,
+    pipelineConfig.merge_links_across_runs !== undefined
+      ? pipelineConfig.merge_links_across_runs
+      : true
+  ),
+  redisEnqueueBatchSize: Number(
+    process.env.REDIS_ENQUEUE_BATCH_SIZE ||
+      pipelineConfig.redis_enqueue_batch_size ||
+      500
+  ),
+  mongoBulkWriteBatchSize: Number(
+    process.env.MONGO_BULK_WRITE_BATCH_SIZE ||
+      pipelineConfig.mongo_bulk_write_batch_size ||
+      1000
+  ),
+  htmlMongoLockMs: Number(
+    process.env.HTML_MONGO_LOCK_MS ||
+      pipelineConfig.html_mongo_lock_ms ||
+      300000
+  ),
+  htmlMongoPollMs: Number(
+    process.env.HTML_MONGO_POLL_MS ||
+      pipelineConfig.html_mongo_poll_ms ||
+      2000
+  ),
+  htmlMongoRetryErrors: parseBoolean(
+    process.env.HTML_MONGO_RETRY_ERRORS,
+    pipelineConfig.html_mongo_retry_errors !== undefined
+      ? pipelineConfig.html_mongo_retry_errors
+      : false
+  ),
+  htmlMongoRetryDelayMs: Number(
+    process.env.HTML_MONGO_RETRY_DELAY_MS ||
+      pipelineConfig.html_mongo_retry_delay_ms ||
+      300000
+  )
 };
 
 const streamConfig = pipelineConfig.streams || {};
@@ -191,6 +244,40 @@ function parseArgs(argv) {
     }
   }
   return parsed;
+}
+
+function toPositiveInt(value, fallback) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) {
+    return fallback;
+  }
+  return Math.floor(num);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function buildQueuePayload(url, careerUrl) {
+  return JSON.stringify({ url, careerUrl });
+}
+
+function getBatchSize(value, fallback) {
+  return toPositiveInt(value, fallback);
+}
+
+function chunkArray(items, size) {
+  const out = [];
+  if (!Array.isArray(items) || !items.length) {
+    return out;
+  }
+  const safeSize = getBatchSize(size, 500);
+  for (let i = 0; i < items.length; i += safeSize) {
+    out.push(items.slice(i, i + safeSize));
+  }
+  return out;
 }
 
 function normalizeLink(link) {
@@ -310,6 +397,330 @@ async function selectSeedCollection(db, candidates, fieldName, markField) {
   return { name: uniqueCandidates[0], reason: "fallback" };
 }
 
+let ensureIndexesPromise = null;
+
+async function ensurePipelineIndexes(db) {
+  if (ensureIndexesPromise) {
+    return ensureIndexesPromise;
+  }
+  ensureIndexesPromise = (async () => {
+    const tasks = [
+      {
+        name: collections.careerLinks,
+        key: { careerUrl: 1 },
+        options: { unique: true }
+      },
+      {
+        name: collections.jobHtml,
+        key: { url: 1 },
+        options: { unique: true }
+      },
+      {
+        name: collections.jobLinks,
+        key: { url: 1 },
+        options: { unique: true }
+      },
+      {
+        name: collections.jobLinks,
+        key: { htmlStatus: 1, htmlLockUntil: 1, _id: 1 },
+        options: {}
+      },
+      {
+        name: collections.jobLinks,
+        key: { lastDiscoveredAt: 1 },
+        options: {}
+      }
+    ];
+
+    for (const task of tasks) {
+      try {
+        await db.collection(task.name).createIndex(task.key, task.options);
+      } catch (error) {
+        log("Index creation warning.", {
+          collection: task.name,
+          key: task.key,
+          error: error.toString()
+        });
+      }
+    }
+  })();
+  return ensureIndexesPromise;
+}
+
+function buildCareerLinksSuccessUpdate(
+  careerUrl,
+  links,
+  jobLinks,
+  source,
+  userAgent,
+  startedAt
+) {
+  const now = new Date();
+  if (!settings.mergeLinksAcrossRuns) {
+    return {
+      $set: {
+        careerUrl,
+        links,
+        linkCount: links.length,
+        jobLinks,
+        jobLinkCount: jobLinks.length,
+        source,
+        userAgent,
+        fetchedAt: now,
+        startedAt,
+        lastSuccessAt: now,
+        updatedAt: now,
+        error: null
+      },
+      $setOnInsert: {
+        createdAt: now
+      }
+    };
+  }
+
+  return [
+    {
+      $set: {
+        careerUrl,
+        links: {
+          $setUnion: [{ $ifNull: ["$links", []] }, links]
+        },
+        jobLinks: {
+          $setUnion: [{ $ifNull: ["$jobLinks", []] }, jobLinks]
+        },
+        source,
+        userAgent,
+        fetchedAt: now,
+        startedAt,
+        lastSuccessAt: now,
+        updatedAt: now,
+        error: null,
+        createdAt: { $ifNull: ["$createdAt", now] }
+      }
+    },
+    {
+      $set: {
+        linkCount: { $size: "$links" },
+        jobLinkCount: { $size: "$jobLinks" }
+      }
+    }
+  ];
+}
+
+function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
+  const now = new Date();
+  if (settings.preserveLinksOnError) {
+    return {
+      $set: {
+        careerUrl,
+        error: error.toString(),
+        lastErrorAt: now,
+        fetchedAt: now,
+        startedAt,
+        updatedAt: now
+      },
+      $setOnInsert: {
+        links: [],
+        linkCount: 0,
+        jobLinks: [],
+        jobLinkCount: 0,
+        createdAt: now
+      }
+    };
+  }
+  return {
+    $set: {
+      careerUrl,
+      links: [],
+      linkCount: 0,
+      jobLinks: [],
+      jobLinkCount: 0,
+      error: error.toString(),
+      lastErrorAt: now,
+      fetchedAt: now,
+      startedAt,
+      updatedAt: now
+    },
+    $setOnInsert: {
+      createdAt: now
+    }
+  };
+}
+
+async function persistDiscoveredJobLinks(
+  jobLinksCollection,
+  careerUrl,
+  jobLinks,
+  discoveredAt
+) {
+  if (!Array.isArray(jobLinks) || !jobLinks.length) {
+    return 0;
+  }
+  let total = 0;
+  const batches = chunkArray(jobLinks, settings.mongoBulkWriteBatchSize);
+  for (const batch of batches) {
+    const operations = batch.map((jobUrl) => ({
+      updateOne: {
+        filter: { url: jobUrl },
+        update: {
+          $setOnInsert: {
+            url: jobUrl,
+            createdAt: discoveredAt,
+            firstDiscoveredAt: discoveredAt,
+            htmlStatus: "pending",
+            htmlAttempts: 0
+          },
+          $set: {
+            careerUrl,
+            lastDiscoveredAt: discoveredAt,
+            updatedAt: discoveredAt
+          },
+          $addToSet: {
+            careerUrls: careerUrl
+          },
+          $inc: {
+            discoveryCount: 1
+          }
+        },
+        upsert: true
+      }
+    }));
+    if (!operations.length) {
+      continue;
+    }
+    await jobLinksCollection.bulkWrite(operations, { ordered: false });
+    total += operations.length;
+  }
+  return total;
+}
+
+async function enqueueJobLinks(redisClient, careerUrl, jobLinks) {
+  if (!settings.enqueueHtmlFromLinksWorker) {
+    return 0;
+  }
+  if (!Array.isArray(jobLinks) || !jobLinks.length) {
+    return 0;
+  }
+  let enqueued = 0;
+  const entries = jobLinks.map((jobUrl) => ({
+    value: jobUrl,
+    streamValue: buildQueuePayload(jobUrl, careerUrl)
+  }));
+  const batches = chunkArray(entries, settings.redisEnqueueBatchSize);
+  for (const batch of batches) {
+    enqueued += await saddAndStreamBatch(
+      redisClient,
+      queues.careerLinksDedup,
+      queues.careerLinks,
+      batch
+    );
+  }
+  return enqueued;
+}
+
+function buildMongoHtmlClaimQuery(now, options = {}) {
+  const retryErrors =
+    options.retryErrors !== undefined
+      ? options.retryErrors
+      : settings.htmlMongoRetryErrors;
+  const retryDelayMs = toPositiveInt(
+    options.retryDelayMs,
+    settings.htmlMongoRetryDelayMs
+  );
+  const statusQuery = [
+    { htmlStatus: "pending" },
+    { htmlStatus: "processing" },
+    { htmlStatus: { $exists: false } }
+  ];
+  if (retryErrors) {
+    statusQuery.push({
+      htmlStatus: "error",
+      $or: [
+        { htmlErrorAt: { $exists: false } },
+        {
+          htmlErrorAt: {
+            $lte: new Date(now.getTime() - retryDelayMs)
+          }
+        }
+      ]
+    });
+  }
+  return {
+    $and: [
+      { $or: statusQuery },
+      {
+        $or: [
+          { htmlLockUntil: { $exists: false } },
+          { htmlLockUntil: { $lte: now } }
+        ]
+      }
+    ]
+  };
+}
+
+async function claimMongoHtmlJob(jobLinksCollection, consumer, options = {}) {
+  const now = new Date();
+  const lockMs = toPositiveInt(options.lockMs, settings.htmlMongoLockMs);
+  const claimed = await jobLinksCollection.findOneAndUpdate(
+    buildMongoHtmlClaimQuery(now, options),
+    {
+      $set: {
+        htmlStatus: "processing",
+        htmlLockBy: consumer,
+        htmlLockAt: now,
+        htmlLockUntil: new Date(now.getTime() + lockMs),
+        updatedAt: now
+      },
+      $inc: {
+        htmlAttempts: 1
+      }
+    },
+    {
+      sort: { lastDiscoveredAt: 1, _id: 1 },
+      returnDocument: "after",
+      includeResultMetadata: false
+    }
+  );
+  if (claimed && claimed.value) {
+    return claimed.value;
+  }
+  return claimed || null;
+}
+
+async function markMongoHtmlJobState(
+  jobLinksCollection,
+  jobUrl,
+  careerUrl,
+  htmlStatus,
+  extraSet = {}
+) {
+  const now = new Date();
+  const setPayload = {
+    url: jobUrl,
+    htmlStatus,
+    updatedAt: now,
+    ...extraSet
+  };
+  if (careerUrl) {
+    setPayload.careerUrl = careerUrl;
+  }
+  await jobLinksCollection.updateOne(
+    { url: jobUrl },
+    {
+      $set: setPayload,
+      $unset: {
+        htmlLockBy: "",
+        htmlLockAt: "",
+        htmlLockUntil: ""
+      },
+      $setOnInsert: {
+        createdAt: now
+      }
+    },
+    { upsert: true }
+  );
+}
+
 async function fetchCareerLinks(url) {
   let gotResult = null;
   try {
@@ -379,8 +790,9 @@ async function seedFromFile(redisClient, filePath) {
     .split(/\\r?\\n/)
     .map((line) => line.trim())
     .filter(Boolean);
-  for (const url of urls) {
-    await streamAdd(redisClient, queues.careerPages, url);
+  const batches = chunkArray(urls, settings.redisEnqueueBatchSize);
+  for (const batch of batches) {
+    await streamAddBatch(redisClient, queues.careerPages, batch);
   }
   log("Seeded urls from file.", { count: urls.length, queue: queues.careerPages });
 }
@@ -437,40 +849,34 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
     if (!batch.length) {
       return;
     }
+    const now = new Date();
+    const validDocs = batch.filter((doc) => Boolean(doc[fieldName]));
+    const urls = validDocs.map((doc) => doc[fieldName]);
+    if (!urls.length) {
+      batch = [];
+      return;
+    }
+    await streamAddBatch(redisClient, queues.careerPages, urls);
     const updates = [];
-    let pushed = 0;
-    for (const doc of batch) {
-      const url = doc[fieldName];
-      if (!url) {
-        continue;
-      }
-      try {
-        await streamAdd(redisClient, queues.careerPages, url);
-        updates.push({
-          updateOne: {
-            filter: { _id: doc._id },
-            update: {
-              $set: {
-                [safeMarkField]: true,
-                [safeMarkAtField]: new Date()
-              }
+    for (const doc of validDocs) {
+      updates.push({
+        updateOne: {
+          filter: { _id: doc._id },
+          update: {
+            $set: {
+              [safeMarkField]: true,
+              [safeMarkAtField]: now
             }
           }
-        });
-        pushed += 1;
-      } catch (error) {
-        if (updates.length) {
-          await collection.bulkWrite(updates, { ordered: false });
         }
-        throw error;
-      }
+      });
     }
     if (updates.length) {
       await collection.bulkWrite(updates, { ordered: false });
     }
-    count += pushed;
+    count += urls.length;
     log("Seeded mongo batch.", {
-      batchCount: pushed,
+      batchCount: urls.length,
       totalCount: count,
       queue: queues.careerPages,
       collection: collectionName
@@ -502,17 +908,21 @@ async function runLinksWorker(args) {
     mongoConfig.database
   );
   const collection = db.collection(collections.careerLinks);
+  const jobLinksCollection = db.collection(collections.jobLinks);
   const consumer = buildConsumerName("links");
+  await ensurePipelineIndexes(db);
   await ensureStreamGroup(
     redisClient,
     queues.careerPages,
     streamGroups.careerPages
   );
-  await ensureStreamGroup(
-    redisClient,
-    queues.careerLinks,
-    streamGroups.careerLinks
-  );
+  if (settings.enqueueHtmlFromLinksWorker) {
+    await ensureStreamGroup(
+      redisClient,
+      queues.careerLinks,
+      streamGroups.careerLinks
+    );
+  }
   let processed = 0;
   let claimStartId = "0-0";
   let lastClaimAt = 0;
@@ -593,30 +1003,35 @@ async function runLinksWorker(args) {
 
         await collection.updateOne(
           { careerUrl: url },
-          {
-            $set: {
-              careerUrl: url,
-              links: normalizedLinks,
-              linkCount: normalizedLinks.length,
-              jobLinks,
-              jobLinkCount: jobLinks.length,
-              source,
-              userAgent,
-              fetchedAt: new Date(),
-              startedAt
-            }
-          },
+          buildCareerLinksSuccessUpdate(
+            url,
+            normalizedLinks,
+            jobLinks,
+            source,
+            userAgent,
+            startedAt
+          ),
           { upsert: true }
         );
 
-        for (const link of jobLinks) {
-          const payload = JSON.stringify({ url: link, careerUrl: url });
-          await saddAndStream(
-            redisClient,
-            queues.careerLinksDedup,
-            queues.careerLinks,
-            link,
-            payload
+        const discoveredAt = new Date();
+        const persistedCount = await persistDiscoveredJobLinks(
+          jobLinksCollection,
+          url,
+          jobLinks,
+          discoveredAt
+        );
+        const queuedCount = await enqueueJobLinks(redisClient, url, jobLinks);
+        if (settings.enqueueHtmlFromLinksWorker && jobLinks.length) {
+          await jobLinksCollection.updateMany(
+            { url: { $in: jobLinks } },
+            {
+              $set: {
+                htmlQueued: true,
+                htmlQueuedAt: discoveredAt,
+                updatedAt: discoveredAt
+              }
+            }
           );
         }
 
@@ -625,23 +1040,15 @@ async function runLinksWorker(args) {
           url,
           linkCount: normalizedLinks.length,
           jobLinkCount: jobLinks.length,
-          source
+          source,
+          persistedJobLinks: persistedCount,
+          queuedJobLinks: queuedCount,
+          enqueueHtmlFromLinksWorker: settings.enqueueHtmlFromLinksWorker
         });
       } catch (error) {
         await collection.updateOne(
           { careerUrl: url },
-          {
-            $set: {
-              careerUrl: url,
-              links: [],
-              linkCount: 0,
-              jobLinks: [],
-              jobLinkCount: 0,
-              error: error.toString(),
-              fetchedAt: new Date(),
-              startedAt
-            }
-          },
+          buildCareerLinksErrorUpdate(url, error, startedAt),
           { upsert: true }
         );
         log("Error fetching career links.", { url, error: error.toString() });
@@ -672,7 +1079,9 @@ async function runHtmlWorker(args) {
     mongoConfig.database
   );
   const collection = db.collection(collections.jobHtml);
+  const jobLinksCollection = db.collection(collections.jobLinks);
   const consumer = buildConsumerName("html");
+  await ensurePipelineIndexes(db);
   await ensureStreamGroup(
     redisClient,
     queues.careerLinks,
@@ -750,6 +1159,7 @@ async function runHtmlWorker(args) {
             excludePatterns: settings.jobLinkExcludePatterns
           }).length > 0;
         if (!isJobLink) {
+          const fetchedAt = new Date();
           await collection.updateOne(
             { url: jobUrl },
             {
@@ -758,12 +1168,23 @@ async function runHtmlWorker(args) {
                   html: "",
                   skipped: true,
                   skipReason: "non_job_link",
-                  fetchedAt: new Date(),
+                  fetchedAt,
                   startedAt
                 })
               }
             },
             { upsert: true }
+          );
+          await markMongoHtmlJobState(
+            jobLinksCollection,
+            jobUrl,
+            careerUrl,
+            "skipped",
+            {
+              skipReason: "non_job_link",
+              htmlFetchedAt: fetchedAt,
+              htmlError: null
+            }
           );
           log("Skipped non-job link.", { url: jobUrl });
           continue;
@@ -778,6 +1199,7 @@ async function runHtmlWorker(args) {
             parsedLdJson = null;
           }
         }
+        const fetchedAt = new Date();
         await collection.updateOne(
           { url: jobUrl },
           {
@@ -789,17 +1211,30 @@ async function runHtmlWorker(args) {
                 ldjsonRaw: jobPosting,
                 ldjsonParsed: parsedLdJson,
                 ldjsonBlocks: rawBlocks,
-                fetchedAt: new Date(),
+                fetchedAt,
                 startedAt
               })
             }
           },
           { upsert: true }
         );
+        await markMongoHtmlJobState(
+          jobLinksCollection,
+          jobUrl,
+          careerUrl,
+          "done",
+          {
+            htmlFetchedAt: fetchedAt,
+            htmlSource: source,
+            htmlUserAgent: userAgent,
+            htmlError: null
+          }
+        );
         processed += 1;
         log("HTML fetched.", { url: jobUrl, source, length: html.length });
       } catch (error) {
         const fallbackUrl = jobUrl || message.value;
+        const fetchedAt = new Date();
         await collection.updateOne(
           { url: fallbackUrl },
           {
@@ -807,12 +1242,22 @@ async function runHtmlWorker(args) {
               ...buildJobUpdate(fallbackUrl, careerUrl, {
                 html: "",
                 error: error.toString(),
-                fetchedAt: new Date(),
+                fetchedAt,
                 startedAt
               })
             }
           },
           { upsert: true }
+        );
+        await markMongoHtmlJobState(
+          jobLinksCollection,
+          fallbackUrl,
+          careerUrl,
+          "error",
+          {
+            htmlError: error.toString(),
+            htmlErrorAt: fetchedAt
+          }
         );
         log("Error fetching HTML.", { url: fallbackUrl, error: error.toString() });
       } finally {
@@ -835,6 +1280,301 @@ async function runHtmlWorker(args) {
   }
 }
 
+async function runHtmlMongoWorker(args) {
+  const { client: mongoClient, db } = await connectMongo(
+    mongoConfig.uri,
+    mongoConfig.database
+  );
+  const collection = db.collection(collections.jobHtml);
+  const jobLinksCollection = db.collection(collections.jobLinks);
+  const consumer = buildConsumerName("html-mongo");
+  const retryErrors = parseBoolean(args["retry-errors"], settings.htmlMongoRetryErrors);
+  const retryDelayMs = toPositiveInt(
+    args["retry-delay-ms"] || args.retryDelayMs,
+    settings.htmlMongoRetryDelayMs
+  );
+  const lockMs = toPositiveInt(
+    args["lock-ms"] || args.lockMs,
+    settings.htmlMongoLockMs
+  );
+  const pollMs = toPositiveInt(
+    args["poll-ms"] || args.pollMs,
+    settings.htmlMongoPollMs
+  );
+  const max = Number(args.max || 0);
+  let processed = 0;
+
+  await ensurePipelineIndexes(db);
+
+  try {
+    while (true) {
+      const claimed = await claimMongoHtmlJob(jobLinksCollection, consumer, {
+        retryErrors,
+        retryDelayMs,
+        lockMs
+      });
+      if (!claimed) {
+        if (args.once) {
+          break;
+        }
+        await sleep(pollMs);
+        continue;
+      }
+
+      const startedAt = new Date();
+      const jobUrl = claimed.url;
+      const careerUrl =
+        claimed.careerUrl ||
+        (Array.isArray(claimed.careerUrls) && claimed.careerUrls.length
+          ? claimed.careerUrls[0]
+          : null);
+
+      if (!jobUrl) {
+        await jobLinksCollection.updateOne(
+          { _id: claimed._id },
+          {
+            $set: {
+              htmlStatus: "error",
+              htmlError: "Missing url in job links collection record.",
+              htmlErrorAt: new Date(),
+              updatedAt: new Date()
+            },
+            $unset: {
+              htmlLockBy: "",
+              htmlLockAt: "",
+              htmlLockUntil: ""
+            }
+          }
+        );
+        continue;
+      }
+
+      try {
+        const isJobLink =
+          filterJobLinks([jobUrl], {
+            strongPatterns: settings.jobLinkStrongPatterns,
+            weakPatterns: settings.jobLinkWeakPatterns,
+            excludePatterns: settings.jobLinkExcludePatterns
+          }).length > 0;
+        if (!isJobLink) {
+          const fetchedAt = new Date();
+          await collection.updateOne(
+            { url: jobUrl },
+            {
+              $set: {
+                ...buildJobUpdate(jobUrl, careerUrl, {
+                  html: "",
+                  skipped: true,
+                  skipReason: "non_job_link",
+                  fetchedAt,
+                  startedAt
+                })
+              }
+            },
+            { upsert: true }
+          );
+          await markMongoHtmlJobState(
+            jobLinksCollection,
+            jobUrl,
+            careerUrl,
+            "skipped",
+            {
+              skipReason: "non_job_link",
+              htmlFetchedAt: fetchedAt,
+              htmlError: null
+            }
+          );
+          processed += 1;
+          log("Skipped non-job link.", { url: jobUrl, source: "mongo" });
+        } else {
+          const { html, source, userAgent } = await fetchPageHtml(jobUrl);
+          const { rawBlocks, jobPosting } = extractJobPostingFromHtml(html);
+          let parsedLdJson = null;
+          if (jobPosting) {
+            try {
+              parsedLdJson = await parseLdJson(jobPosting);
+            } catch (error) {
+              parsedLdJson = null;
+            }
+          }
+          const fetchedAt = new Date();
+          await collection.updateOne(
+            { url: jobUrl },
+            {
+              $set: {
+                ...buildJobUpdate(jobUrl, careerUrl, {
+                  // html,
+                  source,
+                  userAgent,
+                  ldjsonRaw: jobPosting,
+                  ldjsonParsed: parsedLdJson,
+                  ldjsonBlocks: rawBlocks,
+                  fetchedAt,
+                  startedAt
+                })
+              }
+            },
+            { upsert: true }
+          );
+          await markMongoHtmlJobState(
+            jobLinksCollection,
+            jobUrl,
+            careerUrl,
+            "done",
+            {
+              htmlFetchedAt: fetchedAt,
+              htmlSource: source,
+              htmlUserAgent: userAgent,
+              htmlError: null
+            }
+          );
+          processed += 1;
+          log("HTML fetched.", { url: jobUrl, source, length: html.length });
+        }
+      } catch (error) {
+        const fetchedAt = new Date();
+        await collection.updateOne(
+          { url: jobUrl },
+          {
+            $set: {
+              ...buildJobUpdate(jobUrl, careerUrl, {
+                html: "",
+                error: error.toString(),
+                fetchedAt,
+                startedAt
+              })
+            }
+          },
+          { upsert: true }
+        );
+        await markMongoHtmlJobState(
+          jobLinksCollection,
+          jobUrl,
+          careerUrl,
+          "error",
+          {
+            htmlError: error.toString(),
+            htmlErrorAt: fetchedAt
+          }
+        );
+        log("Error fetching HTML.", { url: jobUrl, error: error.toString() });
+      }
+
+      if (max > 0 && processed >= max) {
+        break;
+      }
+    }
+  } finally {
+    await closeBrowser();
+    await mongoClient.close();
+  }
+}
+
+async function seedJobLinksToHtmlQueue(args) {
+  const redisClient = await createRedisClient(redisUrl);
+  const { client: mongoClient, db } = await connectMongo(
+    mongoConfig.uri,
+    mongoConfig.database
+  );
+  const jobLinksCollection = db.collection(collections.jobLinks);
+  const batchSize = toPositiveInt(
+    args["batch-size"] || args.batchSize,
+    settings.redisEnqueueBatchSize
+  );
+  const max = Number(args.max || 0);
+  const useDedupe = parseBoolean(args["use-dedupe"], false);
+
+  let totalQueued = 0;
+  let batch = [];
+  const query = {
+    url: { $exists: true, $ne: null },
+    htmlStatus: { $nin: ["done", "skipped"] },
+    htmlQueued: { $ne: true }
+  };
+  let cursor = jobLinksCollection.find(query, {
+    projection: { url: 1, careerUrl: 1 },
+    sort: { _id: 1 }
+  });
+  if (max > 0) {
+    cursor = cursor.limit(max);
+  }
+  cursor = cursor.batchSize(batchSize);
+  await ensurePipelineIndexes(db);
+
+  await ensureStreamGroup(
+    redisClient,
+    queues.careerLinks,
+    streamGroups.careerLinks
+  );
+
+  const flushBatch = async () => {
+    if (!batch.length) {
+      return;
+    }
+    const now = new Date();
+    const valid = batch.filter((doc) => Boolean(doc.url));
+    if (!valid.length) {
+      batch = [];
+      return;
+    }
+    if (useDedupe) {
+      const entries = valid.map((doc) => ({
+        value: doc.url,
+        streamValue: buildQueuePayload(doc.url, doc.careerUrl)
+      }));
+      await saddAndStreamBatch(
+        redisClient,
+        queues.careerLinksDedup,
+        queues.careerLinks,
+        entries
+      );
+    } else {
+      const payloads = valid.map((doc) => buildQueuePayload(doc.url, doc.careerUrl));
+      await streamAddBatch(redisClient, queues.careerLinks, payloads);
+    }
+
+    const updates = valid.map((doc) => ({
+      updateOne: {
+        filter: { _id: doc._id },
+        update: {
+          $set: {
+            htmlQueued: true,
+            htmlQueuedAt: now,
+            updatedAt: now
+          }
+        }
+      }
+    }));
+    if (updates.length) {
+      await jobLinksCollection.bulkWrite(updates, { ordered: false });
+    }
+    totalQueued += valid.length;
+    log("Queued job links batch for html worker.", {
+      batchSize: valid.length,
+      totalQueued
+    });
+    batch = [];
+  };
+
+  try {
+    for await (const doc of cursor) {
+      batch.push(doc);
+      if (batch.length >= batchSize) {
+        await flushBatch();
+      }
+    }
+    await flushBatch();
+    log("Queued job links for html worker.", {
+      totalQueued,
+      queue: queues.careerLinks,
+      dedupe: useDedupe
+    });
+  } finally {
+    await redisClient.quit();
+    await mongoClient.close();
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0];
@@ -845,7 +1585,10 @@ async function main() {
     console.log("  node pipeline/index.js seed --collection <name> --field <field> [--batch-size <n>] [--max <n>]");
     console.log("                             [--mark-field <name>] [--mark-at-field <name>]");
     console.log("  node pipeline/index.js worker:links [--once] [--max <n>]");
-    console.log("  node pipeline/index.js worker:html [--once] [--max <n>]");
+    console.log("  node pipeline/index.js seed:job-links [--batch-size <n>] [--max <n>] [--use-dedupe]");
+    console.log("  node pipeline/index.js worker:html [--once] [--max <n>] [--source redis|mongo]");
+    console.log("  node pipeline/index.js worker:html-mongo [--once] [--max <n>]");
+    console.log("       optional: [--retry-errors] [--retry-delay-ms <n>] [--poll-ms <n>] [--lock-ms <n>]");
     process.exit(1);
   }
 
@@ -936,8 +1679,23 @@ async function main() {
     return;
   }
 
+  if (command === "seed:job-links") {
+    await seedJobLinksToHtmlQueue(args);
+    return;
+  }
+
   if (command === "worker:html") {
-    await runHtmlWorker(args);
+    const source = String(args.source || "").toLowerCase();
+    if (source === "mongo") {
+      await runHtmlMongoWorker(args);
+    } else {
+      await runHtmlWorker(args);
+    }
+    return;
+  }
+
+  if (command === "worker:html-mongo") {
+    await runHtmlMongoWorker(args);
     return;
   }
 

@@ -41,6 +41,20 @@ async function streamAdd(client, streamKey, value) {
   await client.xAdd(streamKey, "*", { value: payload });
 }
 
+async function streamAddBatch(client, streamKey, values) {
+  if (!Array.isArray(values) || !values.length) {
+    return 0;
+  }
+  const multi = client.multi();
+  for (const value of values) {
+    const payload =
+      typeof value === "string" ? value : JSON.stringify(value);
+    multi.xAdd(streamKey, "*", { value: payload });
+  }
+  const replies = await multi.exec();
+  return Array.isArray(replies) ? replies.length : 0;
+}
+
 async function streamReadGroup(
   client,
   streamKey,
@@ -254,15 +268,74 @@ async function saddAndStream(
   return added;
 }
 
+async function saddAndStreamBatch(
+  client,
+  setKey,
+  streamKey,
+  entries
+) {
+  if (!Array.isArray(entries) || !entries.length) {
+    return 0;
+  }
+
+  const normalized = entries
+    .map((entry) => {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        !Array.isArray(entry)
+      ) {
+        const dedupeValue = entry.value;
+        const streamValue =
+          entry.streamValue === undefined ? entry.value : entry.streamValue;
+        return { dedupeValue, streamValue };
+      }
+      return {
+        dedupeValue: entry,
+        streamValue: entry
+      };
+    })
+    .filter((entry) => entry.dedupeValue !== undefined && entry.dedupeValue !== null);
+
+  if (!normalized.length) {
+    return 0;
+  }
+
+  const dedupeMulti = client.multi();
+  for (const entry of normalized) {
+    dedupeMulti.sAdd(setKey, entry.dedupeValue);
+  }
+  const dedupeReplies = await dedupeMulti.exec();
+
+  const streamMulti = client.multi();
+  let added = 0;
+  for (let i = 0; i < normalized.length; i += 1) {
+    if (Number(dedupeReplies[i]) === 1) {
+      added += 1;
+      const payload =
+        typeof normalized[i].streamValue === "string"
+          ? normalized[i].streamValue
+          : JSON.stringify(normalized[i].streamValue);
+      streamMulti.xAdd(streamKey, "*", { value: payload });
+    }
+  }
+  if (added > 0) {
+    await streamMulti.exec();
+  }
+  return added;
+}
+
 module.exports = {
   createRedisClient,
   blpop,
   rpush,
   ensureStreamGroup,
   streamAdd,
+  streamAddBatch,
   streamReadGroup,
   streamAutoClaimOne,
   streamAck,
   saddAndQueue,
-  saddAndStream
+  saddAndStream,
+  saddAndStreamBatch
 };

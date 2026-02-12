@@ -6,8 +6,10 @@
   "main": "pipeline/index.js",
   "scripts": {
     "seed": "node pipeline/index.js seed",
+    "seed:job-links": "node pipeline/index.js seed:job-links",
     "worker:links": "node pipeline/index.js worker:links",
-    "worker:html": "node pipeline/index.js worker:html"
+    "worker:html": "node pipeline/index.js worker:html",
+    "worker:html:mongo": "node pipeline/index.js worker:html-mongo"
   },
   "dependencies": {
     "config": "^3.3.9",

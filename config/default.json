@@ -123,7 +123,8 @@
         "collections": {
             "career_pages": "career_pages",
             "career_links": "career_links",
-            "job_html": "career_html"
+            "job_html": "career_html",
+            "job_links": "career_link_jobs"
         },
         "same_domain_only": true,
         "min_links_for_got": 5,
@@ -131,6 +132,15 @@
         "got_timeout_ms": 20000,
         "puppeteer_timeout_ms": 60000,
         "poll_timeout_seconds": 5,
+        "enqueue_html_from_links_worker": false,
+        "preserve_links_on_error": true,
+        "merge_links_across_runs": true,
+        "redis_enqueue_batch_size": 500,
+        "mongo_bulk_write_batch_size": 1000,
+        "html_mongo_lock_ms": 300000,
+        "html_mongo_poll_ms": 2000,
+        "html_mongo_retry_errors": false,
+        "html_mongo_retry_delay_ms": 300000,
         "job_link_strong_patterns": [
             "jobid=",
             "job_id=",
