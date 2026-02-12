@@ -408,7 +408,7 @@ async function ensurePipelineIndexes(db) {
       {
         name: collections.careerLinks,
         key: { careerUrl: 1 },
-        options: { unique: true }
+        options: {}
       },
       {
         name: collections.jobHtml,
