@@ -82,6 +82,11 @@ npm run worker:html
 npm run seed:job-links -- --batch-size 2000
 ```
 
+- Force reseed of pending HTML queue flags:
+```bash
+npm run seed:job-links -- --reset-queued --batch-size 2000
+```
+
 ## Quick Start (CLI Style You Are Using)
 
 ```bash
@@ -140,6 +145,9 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `HTML_MONGO_POLL_MS`: idle poll delay in Mongo HTML worker.
 - `HTML_MONGO_RETRY_ERRORS`: allow retry of error-state docs.
 - `HTML_MONGO_RETRY_DELAY_MS`: delay before retrying error docs.
+- `LINKS_WORKER_CONCURRENCY`: per-process message concurrency for links workers.
+- `HTML_WORKER_CONCURRENCY`: per-process message concurrency for Redis HTML workers.
+- `PUPPETEER_ON_SHORT_HTML`: if `false`, accept non-empty Got HTML without Puppeteer fallback (lower load, faster).
 
 ## Mongo Collections and Meaning
 
@@ -160,6 +168,7 @@ If you use `seed:job-links`, default is `--use-dedupe false` so old Redis dedupe
 3. Run `worker:html-mongo` as a separate stage.
 4. Tune `REDIS_ENQUEUE_BATCH_SIZE` and `MONGO_BULK_WRITE_BATCH_SIZE`.
 5. Keep Mongo indexes healthy (`career_link_jobs.url`, `career_html.url`, `career_links.careerUrl`).
+6. For Redis HTML workers, start with `HTML_WORKER_CONCURRENCY=1` and increase gradually only if CPU/RAM allow.
 
 ## Troubleshooting
 

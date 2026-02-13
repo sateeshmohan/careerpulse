@@ -115,9 +115,9 @@
                 "career_links": "career-links"
             },
             "block_ms": 5000,
-            "read_count": 1,
+            "read_count": 10,
             "claim_min_idle_ms": 60000,
-            "claim_count": 1,
+            "claim_count": 10,
             "claim_interval_ms": 30000
         },
         "collections": {
@@ -141,6 +141,9 @@
         "html_mongo_poll_ms": 2000,
         "html_mongo_retry_errors": false,
         "html_mongo_retry_delay_ms": 300000,
+        "links_worker_concurrency": 1,
+        "html_worker_concurrency": 1,
+        "puppeteer_on_short_html": false,
         "job_link_strong_patterns": [
             "jobid=",
             "job_id=",

@@ -14,8 +14,8 @@ const {
   createRedisClient,
   ensureStreamGroup,
   streamAddBatch,
-  streamReadGroup,
-  streamAutoClaimOne,
+  streamReadGroupBatch,
+  streamAutoClaimBatch,
   streamAck,
   saddAndStreamBatch
 } = require("./redis_queue");
@@ -174,6 +174,22 @@ const settings = {
     process.env.HTML_MONGO_RETRY_DELAY_MS ||
       pipelineConfig.html_mongo_retry_delay_ms ||
       300000
+  ),
+  linksWorkerConcurrency: Number(
+    process.env.LINKS_WORKER_CONCURRENCY ||
+      pipelineConfig.links_worker_concurrency ||
+      1
+  ),
+  htmlWorkerConcurrency: Number(
+    process.env.HTML_WORKER_CONCURRENCY ||
+      pipelineConfig.html_worker_concurrency ||
+      1
+  ),
+  fallBackToPuppeteerOnShortHtml: parseBoolean(
+    process.env.PUPPETEER_ON_SHORT_HTML,
+    pipelineConfig.puppeteer_on_short_html !== undefined
+      ? pipelineConfig.puppeteer_on_short_html
+      : false
   )
 };
 
@@ -278,6 +294,78 @@ function chunkArray(items, size) {
     out.push(items.slice(i, i + safeSize));
   }
   return out;
+}
+
+async function processWithConcurrency(items, concurrency, handler) {
+  if (!Array.isArray(items) || !items.length) {
+    return;
+  }
+  const safeConcurrency = Math.min(
+    items.length,
+    getBatchSize(concurrency, 1)
+  );
+  let nextIndex = 0;
+  const workers = Array.from({ length: safeConcurrency }, () =>
+    (async () => {
+      while (true) {
+        const current = nextIndex;
+        nextIndex += 1;
+        if (current >= items.length) {
+          return;
+        }
+        await handler(items[current], current);
+      }
+    })()
+  );
+  await Promise.all(workers);
+}
+
+async function readStreamWorkBatch(
+  redisClient,
+  streamKey,
+  group,
+  consumer,
+  claimState
+) {
+  let messages = [];
+  if (
+    streamSettings.claimMinIdleMs > 0 &&
+    streamSettings.claimIntervalMs > 0
+  ) {
+    const now = Date.now();
+    if (now - claimState.lastClaimAt >= streamSettings.claimIntervalMs) {
+      claimState.lastClaimAt = now;
+      const claimResult = await streamAutoClaimBatch(
+        redisClient,
+        streamKey,
+        group,
+        consumer,
+        streamSettings.claimMinIdleMs,
+        claimState.claimStartId,
+        streamSettings.claimCount
+      );
+      if (claimResult) {
+        claimState.claimStartId = claimResult.nextId || claimState.claimStartId;
+        if (Array.isArray(claimResult.messages) && claimResult.messages.length) {
+          messages = claimResult.messages;
+        }
+      }
+    }
+  }
+  if (!messages.length) {
+    const readResult = await streamReadGroupBatch(
+      redisClient,
+      streamKey,
+      group,
+      consumer,
+      streamSettings.blockMs,
+      streamSettings.readCount
+    );
+    if (Array.isArray(readResult) && readResult.length) {
+      messages = readResult;
+    }
+  }
+  return messages;
 }
 
 function normalizeLink(link) {
@@ -759,7 +847,14 @@ async function fetchPageHtml(url) {
     const gotResult = await fetchHtmlWithGot(url, {
       timeoutMs: settings.gotTimeoutMs
     });
-    if (gotResult.html && gotResult.html.length >= settings.minHtmlLength) {
+    const htmlLength = gotResult.html ? gotResult.html.length : 0;
+    if (!gotResult.html) {
+      throw new Error("Got returned empty html body.");
+    }
+    if (
+      htmlLength >= settings.minHtmlLength ||
+      !settings.fallBackToPuppeteerOnShortHtml
+    ) {
       return {
         html: gotResult.html,
         source: "got",
@@ -768,7 +863,7 @@ async function fetchPageHtml(url) {
     }
     log("Got returned short html, falling back to puppeteer.", {
       url,
-      length: gotResult.html ? gotResult.html.length : 0
+      length: htmlLength
     });
   } catch (error) {
     log("Got failed for html fetch, falling back to puppeteer.", {
@@ -924,142 +1019,124 @@ async function runLinksWorker(args) {
     );
   }
   let processed = 0;
-  let claimStartId = "0-0";
-  let lastClaimAt = 0;
+  const claimState = {
+    claimStartId: "0-0",
+    lastClaimAt: 0
+  };
 
   try {
     while (true) {
-      let message = null;
-      if (
-        streamSettings.claimMinIdleMs > 0 &&
-        streamSettings.claimIntervalMs > 0
-      ) {
-        const now = Date.now();
-        if (now - lastClaimAt >= streamSettings.claimIntervalMs) {
-          lastClaimAt = now;
-          const claimResult = await streamAutoClaimOne(
-            redisClient,
-            queues.careerPages,
-            streamGroups.careerPages,
-            consumer,
-            streamSettings.claimMinIdleMs,
-            claimStartId,
-            streamSettings.claimCount
-          );
-          if (claimResult) {
-            claimStartId = claimResult.nextId || claimStartId;
-            message = claimResult.message;
-          }
-        }
-      }
-      if (!message) {
-        message = await streamReadGroup(
-          redisClient,
-          queues.careerPages,
-          streamGroups.careerPages,
-          consumer,
-          streamSettings.blockMs,
-          streamSettings.readCount
-        );
-      }
-      if (!message) {
+      const messages = await readStreamWorkBatch(
+        redisClient,
+        queues.careerPages,
+        streamGroups.careerPages,
+        consumer,
+        claimState
+      );
+      if (!messages.length) {
         if (args.once) {
           break;
         }
         continue;
       }
-      if (!message.value) {
-        await streamAck(
-          redisClient,
-          queues.careerPages,
-          streamGroups.careerPages,
-          message.id
-        );
-        continue;
-      }
-      const url = message.value;
-      if (!url) {
-        await streamAck(
-          redisClient,
-          queues.careerPages,
-          streamGroups.careerPages,
-          message.id
-        );
-        continue;
-      }
+      await processWithConcurrency(
+        messages,
+        settings.linksWorkerConcurrency,
+        async (message) => {
+          if (!message || !message.value) {
+            await streamAck(
+              redisClient,
+              queues.careerPages,
+              streamGroups.careerPages,
+              message ? message.id : null
+            );
+            return;
+          }
+          const url = message.value;
+          if (!url) {
+            await streamAck(
+              redisClient,
+              queues.careerPages,
+              streamGroups.careerPages,
+              message.id
+            );
+            return;
+          }
 
-      const startedAt = new Date();
-      try {
-        const { links, source, userAgent } = await fetchCareerLinks(url);
-        let normalizedLinks = links.map(normalizeLink);
-        normalizedLinks = filterSameDomain(normalizedLinks, url);
-        normalizedLinks = applySocialMediaFilter(normalizedLinks, url);
-        normalizedLinks = Array.from(new Set(normalizedLinks));
-        const jobLinks = filterJobLinks(normalizedLinks, {
-          strongPatterns: settings.jobLinkStrongPatterns,
-          weakPatterns: settings.jobLinkWeakPatterns,
-          excludePatterns: settings.jobLinkExcludePatterns
-        });
+          const startedAt = new Date();
+          try {
+            const { links, source, userAgent } = await fetchCareerLinks(url);
+            let normalizedLinks = links.map(normalizeLink);
+            normalizedLinks = filterSameDomain(normalizedLinks, url);
+            normalizedLinks = applySocialMediaFilter(normalizedLinks, url);
+            normalizedLinks = Array.from(new Set(normalizedLinks));
+            const jobLinks = filterJobLinks(normalizedLinks, {
+              strongPatterns: settings.jobLinkStrongPatterns,
+              weakPatterns: settings.jobLinkWeakPatterns,
+              excludePatterns: settings.jobLinkExcludePatterns
+            });
 
-        await collection.updateOne(
-          { careerUrl: url },
-          buildCareerLinksSuccessUpdate(
-            url,
-            normalizedLinks,
-            jobLinks,
-            source,
-            userAgent,
-            startedAt
-          ),
-          { upsert: true }
-        );
+            await collection.updateOne(
+              { careerUrl: url },
+              buildCareerLinksSuccessUpdate(
+                url,
+                normalizedLinks,
+                jobLinks,
+                source,
+                userAgent,
+                startedAt
+              ),
+              { upsert: true }
+            );
 
-        const discoveredAt = new Date();
-        const persistedCount = await persistDiscoveredJobLinks(
-          jobLinksCollection,
-          url,
-          jobLinks,
-          discoveredAt
-        );
-        const queuedCount = await enqueueJobLinks(redisClient, url, jobLinks);
-        if (settings.enqueueHtmlFromLinksWorker && jobLinks.length) {
-          await jobLinksCollection.updateMany(
-            { url: { $in: jobLinks } },
-            {
-              $set: {
-                htmlQueued: true,
-                htmlQueuedAt: discoveredAt,
-                updatedAt: discoveredAt
-              }
+            const discoveredAt = new Date();
+            const persistedCount = await persistDiscoveredJobLinks(
+              jobLinksCollection,
+              url,
+              jobLinks,
+              discoveredAt
+            );
+            const queuedCount = await enqueueJobLinks(redisClient, url, jobLinks);
+            if (settings.enqueueHtmlFromLinksWorker && jobLinks.length) {
+              await jobLinksCollection.updateMany(
+                { url: { $in: jobLinks } },
+                {
+                  $set: {
+                    htmlQueued: true,
+                    htmlQueuedAt: discoveredAt,
+                    updatedAt: discoveredAt
+                  }
+                }
+              );
             }
-          );
-        }
 
-        processed += 1;
-        log("Career links fetched.", {
-          url,
-          linkCount: normalizedLinks.length,
-          jobLinkCount: jobLinks.length,
-          source,
-          persistedJobLinks: persistedCount,
-          queuedJobLinks: queuedCount,
-          enqueueHtmlFromLinksWorker: settings.enqueueHtmlFromLinksWorker
-        });
-      } catch (error) {
-        await collection.updateOne(
-          { careerUrl: url },
-          buildCareerLinksErrorUpdate(url, error, startedAt),
-          { upsert: true }
-        );
-        log("Error fetching career links.", { url, error: error.toString() });
-      } finally {
-        await streamAck(
-          redisClient,
-          queues.careerPages,
-          streamGroups.careerPages,
-          message.id
-        );
-      }
+            processed += 1;
+            log("Career links fetched.", {
+              url,
+              linkCount: normalizedLinks.length,
+              jobLinkCount: jobLinks.length,
+              source,
+              persistedJobLinks: persistedCount,
+              queuedJobLinks: queuedCount,
+              enqueueHtmlFromLinksWorker: settings.enqueueHtmlFromLinksWorker
+            });
+          } catch (error) {
+            await collection.updateOne(
+              { careerUrl: url },
+              buildCareerLinksErrorUpdate(url, error, startedAt),
+              { upsert: true }
+            );
+            log("Error fetching career links.", { url, error: error.toString() });
+          } finally {
+            await streamAck(
+              redisClient,
+              queues.careerPages,
+              streamGroups.careerPages,
+              message.id
+            );
+          }
+        }
+      );
 
       if (args.max && processed >= args.max) {
         break;
@@ -1088,186 +1165,168 @@ async function runHtmlWorker(args) {
     streamGroups.careerLinks
   );
   let processed = 0;
-  let claimStartId = "0-0";
-  let lastClaimAt = 0;
+  const claimState = {
+    claimStartId: "0-0",
+    lastClaimAt: 0
+  };
 
   try {
     while (true) {
-      let message = null;
-      if (
-        streamSettings.claimMinIdleMs > 0 &&
-        streamSettings.claimIntervalMs > 0
-      ) {
-        const now = Date.now();
-        if (now - lastClaimAt >= streamSettings.claimIntervalMs) {
-          lastClaimAt = now;
-          const claimResult = await streamAutoClaimOne(
-            redisClient,
-            queues.careerLinks,
-            streamGroups.careerLinks,
-            consumer,
-            streamSettings.claimMinIdleMs,
-            claimStartId,
-            streamSettings.claimCount
-          );
-          if (claimResult) {
-            claimStartId = claimResult.nextId || claimStartId;
-            message = claimResult.message;
-          }
-        }
-      }
-      if (!message) {
-        message = await streamReadGroup(
-          redisClient,
-          queues.careerLinks,
-          streamGroups.careerLinks,
-          consumer,
-          streamSettings.blockMs,
-          streamSettings.readCount
-        );
-      }
-      if (!message) {
+      const messages = await readStreamWorkBatch(
+        redisClient,
+        queues.careerLinks,
+        streamGroups.careerLinks,
+        consumer,
+        claimState
+      );
+      if (!messages.length) {
         if (args.once) {
           break;
         }
         continue;
       }
-      if (!message.value) {
-        await streamAck(
-          redisClient,
-          queues.careerLinks,
-          streamGroups.careerLinks,
-          message.id
-        );
-        continue;
-      }
+      await processWithConcurrency(
+        messages,
+        settings.htmlWorkerConcurrency,
+        async (message) => {
+          if (!message || !message.value) {
+            await streamAck(
+              redisClient,
+              queues.careerLinks,
+              streamGroups.careerLinks,
+              message ? message.id : null
+            );
+            return;
+          }
 
-      const startedAt = new Date();
-      let jobUrl = null;
-      let careerUrl = null;
-      try {
-        const parsed = parseQueueItem(message.value);
-        jobUrl = parsed.url;
-        careerUrl = parsed.careerUrl;
-        if (!jobUrl) {
-          continue;
-        }
-        const isJobLink =
-          filterJobLinks([jobUrl], {
-            strongPatterns: settings.jobLinkStrongPatterns,
-            weakPatterns: settings.jobLinkWeakPatterns,
-            excludePatterns: settings.jobLinkExcludePatterns
-          }).length > 0;
-        if (!isJobLink) {
-          const fetchedAt = new Date();
-          await collection.updateOne(
-            { url: jobUrl },
-            {
-              $set: {
-                ...buildJobUpdate(jobUrl, careerUrl, {
-                  html: "",
-                  skipped: true,
-                  skipReason: "non_job_link",
-                  fetchedAt,
-                  startedAt
-                })
-              }
-            },
-            { upsert: true }
-          );
-          await markMongoHtmlJobState(
-            jobLinksCollection,
-            jobUrl,
-            careerUrl,
-            "skipped",
-            {
-              skipReason: "non_job_link",
-              htmlFetchedAt: fetchedAt,
-              htmlError: null
-            }
-          );
-          log("Skipped non-job link.", { url: jobUrl });
-          continue;
-        }
-        const { html, source, userAgent } = await fetchPageHtml(jobUrl);
-        const { rawBlocks, jobPosting } = extractJobPostingFromHtml(html);
-        let parsedLdJson = null;
-        if (jobPosting) {
+          const startedAt = new Date();
+          let jobUrl = null;
+          let careerUrl = null;
           try {
-            parsedLdJson = await parseLdJson(jobPosting);
+            const parsed = parseQueueItem(message.value);
+            jobUrl = parsed.url;
+            careerUrl = parsed.careerUrl;
+            if (!jobUrl) {
+              return;
+            }
+            const isJobLink =
+              filterJobLinks([jobUrl], {
+                strongPatterns: settings.jobLinkStrongPatterns,
+                weakPatterns: settings.jobLinkWeakPatterns,
+                excludePatterns: settings.jobLinkExcludePatterns
+              }).length > 0;
+            if (!isJobLink) {
+              const fetchedAt = new Date();
+              await collection.updateOne(
+                { url: jobUrl },
+                {
+                  $set: {
+                    ...buildJobUpdate(jobUrl, careerUrl, {
+                      html: "",
+                      skipped: true,
+                      skipReason: "non_job_link",
+                      fetchedAt,
+                      startedAt
+                    })
+                  }
+                },
+                { upsert: true }
+              );
+              await markMongoHtmlJobState(
+                jobLinksCollection,
+                jobUrl,
+                careerUrl,
+                "skipped",
+                {
+                  skipReason: "non_job_link",
+                  htmlFetchedAt: fetchedAt,
+                  htmlError: null
+                }
+              );
+              log("Skipped non-job link.", { url: jobUrl });
+              return;
+            }
+            const { html, source, userAgent } = await fetchPageHtml(jobUrl);
+            const { rawBlocks, jobPosting } = extractJobPostingFromHtml(html);
+            let parsedLdJson = null;
+            if (jobPosting) {
+              try {
+                parsedLdJson = await parseLdJson(jobPosting);
+              } catch (error) {
+                parsedLdJson = null;
+              }
+            }
+            const fetchedAt = new Date();
+            await collection.updateOne(
+              { url: jobUrl },
+              {
+                $set: {
+                  ...buildJobUpdate(jobUrl, careerUrl, {
+                    // html,
+                    source,
+                    userAgent,
+                    ldjsonRaw: jobPosting,
+                    ldjsonParsed: parsedLdJson,
+                    ldjsonBlocks: rawBlocks,
+                    fetchedAt,
+                    startedAt
+                  })
+                }
+              },
+              { upsert: true }
+            );
+            await markMongoHtmlJobState(
+              jobLinksCollection,
+              jobUrl,
+              careerUrl,
+              "done",
+              {
+                htmlFetchedAt: fetchedAt,
+                htmlSource: source,
+                htmlUserAgent: userAgent,
+                htmlError: null
+              }
+            );
+            processed += 1;
+            log("HTML fetched.", { url: jobUrl, source, length: html.length });
           } catch (error) {
-            parsedLdJson = null;
+            const fallbackUrl = jobUrl || message.value;
+            const fetchedAt = new Date();
+            await collection.updateOne(
+              { url: fallbackUrl },
+              {
+                $set: {
+                  ...buildJobUpdate(fallbackUrl, careerUrl, {
+                    html: "",
+                    error: error.toString(),
+                    fetchedAt,
+                    startedAt
+                  })
+                }
+              },
+              { upsert: true }
+            );
+            await markMongoHtmlJobState(
+              jobLinksCollection,
+              fallbackUrl,
+              careerUrl,
+              "error",
+              {
+                htmlError: error.toString(),
+                htmlErrorAt: fetchedAt
+              }
+            );
+            log("Error fetching HTML.", { url: fallbackUrl, error: error.toString() });
+          } finally {
+            await streamAck(
+              redisClient,
+              queues.careerLinks,
+              streamGroups.careerLinks,
+              message.id
+            );
           }
         }
-        const fetchedAt = new Date();
-        await collection.updateOne(
-          { url: jobUrl },
-          {
-            $set: {
-              ...buildJobUpdate(jobUrl, careerUrl, {
-                // html,
-                source,
-                userAgent,
-                ldjsonRaw: jobPosting,
-                ldjsonParsed: parsedLdJson,
-                ldjsonBlocks: rawBlocks,
-                fetchedAt,
-                startedAt
-              })
-            }
-          },
-          { upsert: true }
-        );
-        await markMongoHtmlJobState(
-          jobLinksCollection,
-          jobUrl,
-          careerUrl,
-          "done",
-          {
-            htmlFetchedAt: fetchedAt,
-            htmlSource: source,
-            htmlUserAgent: userAgent,
-            htmlError: null
-          }
-        );
-        processed += 1;
-        log("HTML fetched.", { url: jobUrl, source, length: html.length });
-      } catch (error) {
-        const fallbackUrl = jobUrl || message.value;
-        const fetchedAt = new Date();
-        await collection.updateOne(
-          { url: fallbackUrl },
-          {
-            $set: {
-              ...buildJobUpdate(fallbackUrl, careerUrl, {
-                html: "",
-                error: error.toString(),
-                fetchedAt,
-                startedAt
-              })
-            }
-          },
-          { upsert: true }
-        );
-        await markMongoHtmlJobState(
-          jobLinksCollection,
-          fallbackUrl,
-          careerUrl,
-          "error",
-          {
-            htmlError: error.toString(),
-            htmlErrorAt: fetchedAt
-          }
-        );
-        log("Error fetching HTML.", { url: fallbackUrl, error: error.toString() });
-      } finally {
-        await streamAck(
-          redisClient,
-          queues.careerLinks,
-          streamGroups.careerLinks,
-          message.id
-        );
-      }
+      );
 
       if (args.max && processed >= args.max) {
         break;
@@ -1483,13 +1542,18 @@ async function seedJobLinksToHtmlQueue(args) {
   );
   const max = Number(args.max || 0);
   const useDedupe = parseBoolean(args["use-dedupe"], false);
+  const includeQueued = parseBoolean(args["include-queued"], false);
+  const resetQueued = parseBoolean(args["reset-queued"], false);
 
   let totalQueued = 0;
   let batch = [];
-  const query = {
+  const baseStatusQuery = {
     url: { $exists: true, $ne: null },
-    htmlStatus: { $nin: ["done", "skipped"] },
-    htmlQueued: { $ne: true }
+    htmlStatus: { $nin: ["done", "skipped"] }
+  };
+  const query = {
+    ...baseStatusQuery,
+    ...(includeQueued ? {} : { htmlQueued: { $ne: true } })
   };
   let cursor = jobLinksCollection.find(query, {
     projection: { url: 1, careerUrl: 1 },
@@ -1506,6 +1570,21 @@ async function seedJobLinksToHtmlQueue(args) {
     queues.careerLinks,
     streamGroups.careerLinks
   );
+  if (resetQueued) {
+    const resetResult = await jobLinksCollection.updateMany(
+      baseStatusQuery,
+      {
+        $unset: {
+          htmlQueued: "",
+          htmlQueuedAt: ""
+        }
+      }
+    );
+    log("Reset htmlQueued flags for pending links.", {
+      matched: resetResult.matchedCount,
+      modified: resetResult.modifiedCount
+    });
+  }
 
   const flushBatch = async () => {
     if (!batch.length) {
@@ -1517,12 +1596,13 @@ async function seedJobLinksToHtmlQueue(args) {
       batch = [];
       return;
     }
+    let batchQueuedCount = valid.length;
     if (useDedupe) {
       const entries = valid.map((doc) => ({
         value: doc.url,
         streamValue: buildQueuePayload(doc.url, doc.careerUrl)
       }));
-      await saddAndStreamBatch(
+      batchQueuedCount = await saddAndStreamBatch(
         redisClient,
         queues.careerLinksDedup,
         queues.careerLinks,
@@ -1548,9 +1628,10 @@ async function seedJobLinksToHtmlQueue(args) {
     if (updates.length) {
       await jobLinksCollection.bulkWrite(updates, { ordered: false });
     }
-    totalQueued += valid.length;
+    totalQueued += batchQueuedCount;
     log("Queued job links batch for html worker.", {
       batchSize: valid.length,
+      queuedInRedis: batchQueuedCount,
       totalQueued
     });
     batch = [];
@@ -1586,6 +1667,7 @@ async function main() {
     console.log("                             [--mark-field <name>] [--mark-at-field <name>]");
     console.log("  node pipeline/index.js worker:links [--once] [--max <n>]");
     console.log("  node pipeline/index.js seed:job-links [--batch-size <n>] [--max <n>] [--use-dedupe]");
+    console.log("                             [--include-queued] [--reset-queued]");
     console.log("  node pipeline/index.js worker:html [--once] [--max <n>] [--source redis|mongo]");
     console.log("  node pipeline/index.js worker:html-mongo [--once] [--max <n>]");
     console.log("       optional: [--retry-errors] [--retry-delay-ms <n>] [--poll-ms <n>] [--lock-ms <n>]");

@@ -63,6 +63,28 @@ async function streamReadGroup(
   blockMs = 5000,
   count = 1
 ) {
+  const messages = await streamReadGroupBatch(
+    client,
+    streamKey,
+    group,
+    consumer,
+    blockMs,
+    count
+  );
+  if (!messages.length) {
+    return null;
+  }
+  return messages[0];
+}
+
+async function streamReadGroupBatch(
+  client,
+  streamKey,
+  group,
+  consumer,
+  blockMs = 5000,
+  count = 1
+) {
   const streams = await client.xReadGroup(
     group,
     consumer,
@@ -70,17 +92,18 @@ async function streamReadGroup(
     { COUNT: count, BLOCK: blockMs }
   );
   if (!streams || !streams.length) {
-    return null;
+    return [];
   }
   const stream = streams[0];
   if (!stream || !stream.messages || !stream.messages.length) {
-    return null;
+    return [];
   }
-  const message = stream.messages[0];
-  return {
-    id: message.id,
-    value: message.message ? message.message.value : undefined
-  };
+  return stream.messages
+    .map((message) => ({
+      id: message.id,
+      value: message.message ? message.message.value : undefined
+    }))
+    .filter((message) => Boolean(message && message.id));
 }
 
 let autoClaimSupported = true;
@@ -151,11 +174,11 @@ async function streamAutoClaimFallback(
     String(count)
   ]);
   if (!pending || !pending.length) {
-    return { nextId: startId, message: null };
+    return { nextId: startId, messages: [] };
   }
 
   let nextId = startId;
-  let candidateId = null;
+  const candidateIds = [];
   for (let i = 0; i < pending.length; i += 1) {
     const entry = pending[i];
     if (!entry || entry.length < 3) {
@@ -164,31 +187,29 @@ async function streamAutoClaimFallback(
     const id = entry[0];
     const idle = Number(entry[2] || 0);
     nextId = id;
-    if (!candidateId && idle >= minIdleMs) {
-      candidateId = id;
+    if (idle >= minIdleMs) {
+      candidateIds.push(id);
     }
   }
 
-  if (!candidateId) {
-    return { nextId, message: null };
+  if (!candidateIds.length) {
+    return { nextId, messages: [] };
   }
 
-  const claimed = await client.sendCommand([
+  const command = [
     "XCLAIM",
     streamKey,
     group,
     consumer,
     String(minIdleMs),
-    candidateId
-  ]);
+    ...candidateIds
+  ];
+  const claimed = await client.sendCommand(command);
   const normalized = normalizeClaimedMessages(claimed);
-  if (!normalized.length) {
-    return { nextId, message: null };
-  }
-  return { nextId, message: normalized[0] };
+  return { nextId, messages: normalized };
 }
 
-async function streamAutoClaimOne(
+async function streamAutoClaimBatch(
   client,
   streamKey,
   group,
@@ -208,16 +229,15 @@ async function streamAutoClaimOne(
         { COUNT: count }
       );
       const { nextId, messages } = normalizeAutoClaimResult(result);
-      if (!messages || !messages.length) {
-        return { nextId, message: null };
-      }
-      const message = messages[0];
-      return {
-        nextId,
-        message: {
+      const normalizedMessages = (messages || [])
+        .map((message) => ({
           id: message.id,
           value: message.message ? message.message.value : undefined
-        }
+        }))
+        .filter((message) => Boolean(message && message.id));
+      return {
+        nextId,
+        messages: normalizedMessages
       };
     } catch (error) {
       const message = error && error.message ? error.message : "";
@@ -237,6 +257,36 @@ async function streamAutoClaimOne(
     startId,
     count
   );
+}
+
+async function streamAutoClaimOne(
+  client,
+  streamKey,
+  group,
+  consumer,
+  minIdleMs,
+  startId = "0-0",
+  count = 1
+) {
+  const batchResult = await streamAutoClaimBatch(
+    client,
+    streamKey,
+    group,
+    consumer,
+    minIdleMs,
+    startId,
+    count
+  );
+  if (!batchResult || !batchResult.messages || !batchResult.messages.length) {
+    return {
+      nextId: batchResult ? batchResult.nextId : startId,
+      message: null
+    };
+  }
+  return {
+    nextId: batchResult.nextId,
+    message: batchResult.messages[0]
+  };
 }
 
 async function streamAck(client, streamKey, group, id) {
@@ -301,28 +351,37 @@ async function saddAndStreamBatch(
     return 0;
   }
 
-  const dedupeMulti = client.multi();
+  const args = [];
   for (const entry of normalized) {
-    dedupeMulti.sAdd(setKey, entry.dedupeValue);
+    const streamPayload =
+      typeof entry.streamValue === "string"
+        ? entry.streamValue
+        : JSON.stringify(entry.streamValue);
+    args.push(String(entry.dedupeValue), streamPayload);
   }
-  const dedupeReplies = await dedupeMulti.exec();
-
-  const streamMulti = client.multi();
-  let added = 0;
-  for (let i = 0; i < normalized.length; i += 1) {
-    if (Number(dedupeReplies[i]) === 1) {
-      added += 1;
-      const payload =
-        typeof normalized[i].streamValue === "string"
-          ? normalized[i].streamValue
-          : JSON.stringify(normalized[i].streamValue);
-      streamMulti.xAdd(streamKey, "*", { value: payload });
+  // Atomic dedupe + enqueue to avoid losing jobs if process crashes mid-batch.
+  const added = await client.eval(
+    `
+      local setKey = KEYS[1]
+      local streamKey = KEYS[2]
+      local total = 0
+      for i = 1, #ARGV, 2 do
+        local dedupeValue = ARGV[i]
+        local streamValue = ARGV[i + 1]
+        local wasAdded = redis.call("SADD", setKey, dedupeValue)
+        if wasAdded == 1 then
+          redis.call("XADD", streamKey, "*", "value", streamValue)
+          total = total + 1
+        end
+      end
+      return total
+    `,
+    {
+      keys: [setKey, streamKey],
+      arguments: args
     }
-  }
-  if (added > 0) {
-    await streamMulti.exec();
-  }
-  return added;
+  );
+  return Number(added) || 0;
 }
 
 module.exports = {
@@ -332,6 +391,8 @@ module.exports = {
   ensureStreamGroup,
   streamAdd,
   streamAddBatch,
+  streamReadGroupBatch,
+  streamAutoClaimBatch,
   streamReadGroup,
   streamAutoClaimOne,
   streamAck,
