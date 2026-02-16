@@ -118,7 +118,13 @@
             "read_count": 10,
             "claim_min_idle_ms": 60000,
             "claim_count": 10,
-            "claim_interval_ms": 30000
+            "claim_interval_ms": 30000,
+            "delete_acked_messages": true,
+            "retry_on_error": true,
+            "max_retries": 3
+        },
+        "health": {
+            "stats_key": "career:pipeline:health"
         },
         "collections": {
             "career_pages": "career_pages",
@@ -143,6 +149,7 @@
         "html_mongo_retry_delay_ms": 300000,
         "links_worker_concurrency": 1,
         "html_worker_concurrency": 1,
+        "skip_non_job_links_in_html_workers": false,
         "puppeteer_on_short_html": false,
         "job_link_strong_patterns": [
             "jobid=",

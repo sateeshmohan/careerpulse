@@ -77,6 +77,16 @@ npm run worker:html:mongo
 npm run worker:html
 ```
 
+- Check queue + retry health snapshot:
+```bash
+npm run health
+```
+
+- Health snapshot as JSON:
+```bash
+node pipeline/index.js health --json
+```
+
 - Queue Mongo job links into Redis HTML stream (optional path):
 ```bash
 npm run seed:job-links -- --batch-size 2000
@@ -147,7 +157,12 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `HTML_MONGO_RETRY_DELAY_MS`: delay before retrying error docs.
 - `LINKS_WORKER_CONCURRENCY`: per-process message concurrency for links workers.
 - `HTML_WORKER_CONCURRENCY`: per-process message concurrency for Redis HTML workers.
+- `SKIP_NON_JOB_LINKS_IN_HTML_WORKERS`: `false` by default; set `true` only if you want pre-filter skip behavior in HTML workers.
 - `PUPPETEER_ON_SHORT_HTML`: if `false`, accept non-empty Got HTML without Puppeteer fallback (lower load, faster).
+- `STREAM_DELETE_ACKED_MESSAGES`: if `true` (default), remove processed stream entries from Redis after `XACK`.
+- `STREAM_RETRY_ON_ERROR`: if `true` (default), requeue transient stream failures.
+- `STREAM_MAX_RETRIES`: max Redis stream retries before final error persistence (default `3`).
+- `HEALTH_STATS_KEY`: Redis hash key used to store retry counters for health checks.
 
 ## Mongo Collections and Meaning
 

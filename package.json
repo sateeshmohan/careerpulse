@@ -9,7 +9,8 @@
     "seed:job-links": "node pipeline/index.js seed:job-links",
     "worker:links": "node pipeline/index.js worker:links",
     "worker:html": "node pipeline/index.js worker:html",
-    "worker:html:mongo": "node pipeline/index.js worker:html-mongo"
+    "worker:html:mongo": "node pipeline/index.js worker:html-mongo",
+    "health": "node pipeline/index.js health"
   },
   "dependencies": {
     "config": "^3.3.9",

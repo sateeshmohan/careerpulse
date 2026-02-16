@@ -13,6 +13,7 @@ const {
 const {
   createRedisClient,
   ensureStreamGroup,
+  streamAdd,
   streamAddBatch,
   streamReadGroupBatch,
   streamAutoClaimBatch,
@@ -185,6 +186,16 @@ const settings = {
       pipelineConfig.html_worker_concurrency ||
       1
   ),
+  skipNonJobLinksInHtmlWorkers: parseBoolean(
+    process.env.SKIP_NON_JOB_LINKS_IN_HTML_WORKERS,
+    pipelineConfig.skip_non_job_links_in_html_workers !== undefined
+      ? pipelineConfig.skip_non_job_links_in_html_workers
+      : false
+  ),
+  healthStatsKey:
+    process.env.HEALTH_STATS_KEY ||
+    (pipelineConfig.health && pipelineConfig.health.stats_key) ||
+    "career:pipeline:health",
   fallBackToPuppeteerOnShortHtml: parseBoolean(
     process.env.PUPPETEER_ON_SHORT_HTML,
     pipelineConfig.puppeteer_on_short_html !== undefined
@@ -225,7 +236,32 @@ const streamSettings = {
     process.env.STREAM_CLAIM_INTERVAL_MS ||
       streamConfig.claim_interval_ms ||
       30000
-  )
+  ),
+  deleteAckedMessages: parseBoolean(
+    process.env.STREAM_DELETE_ACKED_MESSAGES,
+    streamConfig.delete_acked_messages !== undefined
+      ? streamConfig.delete_acked_messages
+      : true
+  ),
+  retryOnError: parseBoolean(
+    process.env.STREAM_RETRY_ON_ERROR,
+    streamConfig.retry_on_error !== undefined
+      ? streamConfig.retry_on_error
+      : true
+  ),
+  maxRetries: Number.isFinite(Number(process.env.STREAM_MAX_RETRIES))
+    ? Math.max(0, Math.floor(Number(process.env.STREAM_MAX_RETRIES)))
+    : Number.isFinite(Number(streamConfig.max_retries))
+      ? Math.max(0, Math.floor(Number(streamConfig.max_retries)))
+      : 3
+};
+const retryEnvelopeKeys = {
+  payload: "_clf_payload",
+  retry: "_clf_retry",
+  firstSeenAt: "_clf_first_seen_at"
+};
+const streamAckOptions = {
+  deleteMessage: streamSettings.deleteAckedMessages
 };
 
 function log(message, payload) {
@@ -278,6 +314,106 @@ function sleep(ms) {
 
 function buildQueuePayload(url, careerUrl) {
   return JSON.stringify({ url, careerUrl });
+}
+
+function decodeStreamMessageValue(rawValue) {
+  if (!rawValue || typeof rawValue !== "string") {
+    return { value: rawValue, retryCount: 0, firstSeenAt: null };
+  }
+  const trimmed = rawValue.trim();
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) {
+    return { value: rawValue, retryCount: 0, firstSeenAt: null };
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed) ||
+      !Object.prototype.hasOwnProperty.call(parsed, retryEnvelopeKeys.payload)
+    ) {
+      return { value: rawValue, retryCount: 0, firstSeenAt: null };
+    }
+    const retryRaw = Number(parsed[retryEnvelopeKeys.retry] || 0);
+    const retryCount =
+      Number.isFinite(retryRaw) && retryRaw > 0 ? Math.floor(retryRaw) : 0;
+    const payload = parsed[retryEnvelopeKeys.payload];
+    const firstSeenAt = parsed[retryEnvelopeKeys.firstSeenAt] || null;
+    if (payload === null || payload === undefined) {
+      return { value: payload, retryCount, firstSeenAt };
+    }
+    if (typeof payload === "string") {
+      return { value: payload, retryCount, firstSeenAt };
+    }
+    if (typeof payload === "object") {
+      return { value: JSON.stringify(payload), retryCount, firstSeenAt };
+    }
+    return { value: String(payload), retryCount, firstSeenAt };
+  } catch (error) {
+    return { value: rawValue, retryCount: 0, firstSeenAt: null };
+  }
+}
+
+function buildRetryEnvelopePayload(value, retryCount, firstSeenAt) {
+  let payload = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed && (trimmed[0] === "{" || trimmed[0] === "[")) {
+      try {
+        payload = JSON.parse(trimmed);
+      } catch (error) {
+        payload = value;
+      }
+    }
+  }
+  return JSON.stringify({
+    [retryEnvelopeKeys.payload]: payload,
+    [retryEnvelopeKeys.retry]: retryCount,
+    [retryEnvelopeKeys.firstSeenAt]: firstSeenAt || new Date().toISOString()
+  });
+}
+
+async function retryStreamMessage(
+  redisClient,
+  streamKey,
+  value,
+  retryCount,
+  firstSeenAt,
+  context = {}
+) {
+  if (!streamSettings.retryOnError || streamSettings.maxRetries <= 0) {
+    return { requeued: false, reason: "disabled" };
+  }
+  if (retryCount >= streamSettings.maxRetries) {
+    return { requeued: false, reason: "max_retries" };
+  }
+  const nextRetryCount = retryCount + 1;
+  const retryPayload = buildRetryEnvelopePayload(
+    value,
+    nextRetryCount,
+    firstSeenAt
+  );
+  await streamAdd(redisClient, streamKey, retryPayload);
+  try {
+    await redisClient.hIncrBy(settings.healthStatsKey, "retry_requeued_total", 1);
+    await redisClient.hIncrBy(
+      settings.healthStatsKey,
+      `${streamKey}:retry_requeued`,
+      1
+    );
+  } catch (error) {
+    log("Retry counter update warning.", {
+      stream: streamKey,
+      error: error.toString()
+    });
+  }
+  log("Queued stream retry.", {
+    stream: streamKey,
+    retryCount: nextRetryCount,
+    maxRetries: streamSettings.maxRetries,
+    ...context
+  });
+  return { requeued: true, reason: "requeued", retryCount: nextRetryCount };
 }
 
 function getBatchSize(value, fallback) {
@@ -450,6 +586,16 @@ function buildJobUpdate(url, careerUrl, extraFields) {
     update.careerUrl = careerUrl;
   }
   return update;
+}
+
+function isLikelyJobLink(url) {
+  return (
+    filterJobLinks([url], {
+      strongPatterns: settings.jobLinkStrongPatterns,
+      weakPatterns: settings.jobLinkWeakPatterns,
+      excludePatterns: settings.jobLinkExcludePatterns
+    }).length > 0
+  );
 }
 
 async function findAnyDocument(collection, query) {
@@ -1048,21 +1194,25 @@ async function runLinksWorker(args) {
               redisClient,
               queues.careerPages,
               streamGroups.careerPages,
-              message ? message.id : null
+              message ? message.id : null,
+              streamAckOptions
             );
             return;
           }
-          const url = message.value;
+          const decodedMessage = decodeStreamMessageValue(message.value);
+          const url = decodedMessage.value;
           if (!url) {
             await streamAck(
               redisClient,
               queues.careerPages,
               streamGroups.careerPages,
-              message.id
+              message.id,
+              streamAckOptions
             );
             return;
           }
 
+          let shouldAck = false;
           const startedAt = new Date();
           try {
             const { links, source, userAgent } = await fetchCareerLinks(url);
@@ -1118,22 +1268,76 @@ async function runLinksWorker(args) {
               source,
               persistedJobLinks: persistedCount,
               queuedJobLinks: queuedCount,
-              enqueueHtmlFromLinksWorker: settings.enqueueHtmlFromLinksWorker
+              enqueueHtmlFromLinksWorker: settings.enqueueHtmlFromLinksWorker,
+              retryCount: decodedMessage.retryCount
             });
+            shouldAck = true;
           } catch (error) {
-            await collection.updateOne(
-              { careerUrl: url },
-              buildCareerLinksErrorUpdate(url, error, startedAt),
-              { upsert: true }
-            );
-            log("Error fetching career links.", { url, error: error.toString() });
+            try {
+              const requeued = await retryStreamMessage(
+                redisClient,
+                queues.careerPages,
+                decodedMessage.value,
+                decodedMessage.retryCount,
+                decodedMessage.firstSeenAt,
+                {
+                  id: message.id,
+                  url,
+                  error: error.toString()
+                }
+              );
+              if (requeued.requeued) {
+                shouldAck = true;
+                return;
+              }
+              if (requeued.reason === "max_retries") {
+                try {
+                  await redisClient.hIncrBy(
+                    settings.healthStatsKey,
+                    "retry_exhausted_total",
+                    1
+                  );
+                  await redisClient.hIncrBy(
+                    settings.healthStatsKey,
+                    `${queues.careerPages}:retry_exhausted`,
+                    1
+                  );
+                } catch (counterError) {
+                  log("Retry exhausted counter warning.", {
+                    stream: queues.careerPages,
+                    error: counterError.toString()
+                  });
+                }
+              }
+              await collection.updateOne(
+                { careerUrl: url },
+                buildCareerLinksErrorUpdate(url, error, startedAt),
+                { upsert: true }
+              );
+              log("Error fetching career links.", {
+                url,
+                error: error.toString(),
+                retryCount: decodedMessage.retryCount
+              });
+              shouldAck = true;
+            } catch (handlingError) {
+              log("Links failure handling failed. Leaving stream message pending.", {
+                id: message.id,
+                url,
+                error: error.toString(),
+                handlingError: handlingError.toString()
+              });
+            }
           } finally {
-            await streamAck(
-              redisClient,
-              queues.careerPages,
-              streamGroups.careerPages,
-              message.id
-            );
+            if (shouldAck) {
+              await streamAck(
+                redisClient,
+                queues.careerPages,
+                streamGroups.careerPages,
+                message.id,
+                streamAckOptions
+              );
+            }
           }
         }
       );
@@ -1194,28 +1398,30 @@ async function runHtmlWorker(args) {
               redisClient,
               queues.careerLinks,
               streamGroups.careerLinks,
-              message ? message.id : null
+              message ? message.id : null,
+              streamAckOptions
             );
             return;
           }
 
+          const decodedMessage = decodeStreamMessageValue(message.value);
+          const messageValue = decodedMessage.value;
+          let shouldAck = false;
           const startedAt = new Date();
           let jobUrl = null;
           let careerUrl = null;
           try {
-            const parsed = parseQueueItem(message.value);
+            const parsed = parseQueueItem(messageValue);
             jobUrl = parsed.url;
             careerUrl = parsed.careerUrl;
             if (!jobUrl) {
+              shouldAck = true;
               return;
             }
-            const isJobLink =
-              filterJobLinks([jobUrl], {
-                strongPatterns: settings.jobLinkStrongPatterns,
-                weakPatterns: settings.jobLinkWeakPatterns,
-                excludePatterns: settings.jobLinkExcludePatterns
-              }).length > 0;
-            if (!isJobLink) {
+            if (
+              settings.skipNonJobLinksInHtmlWorkers &&
+              !isLikelyJobLink(jobUrl)
+            ) {
               const fetchedAt = new Date();
               await collection.updateOne(
                 { url: jobUrl },
@@ -1244,6 +1450,7 @@ async function runHtmlWorker(args) {
                 }
               );
               log("Skipped non-job link.", { url: jobUrl });
+              shouldAck = true;
               return;
             }
             const { html, source, userAgent } = await fetchPageHtml(jobUrl);
@@ -1288,42 +1495,100 @@ async function runHtmlWorker(args) {
               }
             );
             processed += 1;
-            log("HTML fetched.", { url: jobUrl, source, length: html.length });
+            log("HTML fetched.", {
+              url: jobUrl,
+              source,
+              length: html.length,
+              retryCount: decodedMessage.retryCount
+            });
+            shouldAck = true;
           } catch (error) {
-            const fallbackUrl = jobUrl || message.value;
-            const fetchedAt = new Date();
-            await collection.updateOne(
-              { url: fallbackUrl },
-              {
-                $set: {
-                  ...buildJobUpdate(fallbackUrl, careerUrl, {
-                    html: "",
-                    error: error.toString(),
-                    fetchedAt,
-                    startedAt
-                  })
+            try {
+              const requeued = await retryStreamMessage(
+                redisClient,
+                queues.careerLinks,
+                messageValue,
+                decodedMessage.retryCount,
+                decodedMessage.firstSeenAt,
+                {
+                  id: message.id,
+                  url: jobUrl || messageValue,
+                  error: error.toString()
                 }
-              },
-              { upsert: true }
-            );
-            await markMongoHtmlJobState(
-              jobLinksCollection,
-              fallbackUrl,
-              careerUrl,
-              "error",
-              {
-                htmlError: error.toString(),
-                htmlErrorAt: fetchedAt
+              );
+              if (requeued.requeued) {
+                shouldAck = true;
+                return;
               }
-            );
-            log("Error fetching HTML.", { url: fallbackUrl, error: error.toString() });
+              if (requeued.reason === "max_retries") {
+                try {
+                  await redisClient.hIncrBy(
+                    settings.healthStatsKey,
+                    "retry_exhausted_total",
+                    1
+                  );
+                  await redisClient.hIncrBy(
+                    settings.healthStatsKey,
+                    `${queues.careerLinks}:retry_exhausted`,
+                    1
+                  );
+                } catch (counterError) {
+                  log("Retry exhausted counter warning.", {
+                    stream: queues.careerLinks,
+                    error: counterError.toString()
+                  });
+                }
+              }
+              const fallbackUrl = jobUrl || messageValue;
+              const fetchedAt = new Date();
+              await collection.updateOne(
+                { url: fallbackUrl },
+                {
+                  $set: {
+                    ...buildJobUpdate(fallbackUrl, careerUrl, {
+                      html: "",
+                      error: error.toString(),
+                      fetchedAt,
+                      startedAt
+                    })
+                  }
+                },
+                { upsert: true }
+              );
+              await markMongoHtmlJobState(
+                jobLinksCollection,
+                fallbackUrl,
+                careerUrl,
+                "error",
+                {
+                  htmlError: error.toString(),
+                  htmlErrorAt: fetchedAt
+                }
+              );
+              log("Error fetching HTML.", {
+                url: fallbackUrl,
+                error: error.toString(),
+                retryCount: decodedMessage.retryCount
+              });
+              shouldAck = true;
+            } catch (handlingError) {
+              log("HTML failure handling failed. Leaving stream message pending.", {
+                id: message.id,
+                url: jobUrl || messageValue,
+                error: error.toString(),
+                handlingError: handlingError.toString()
+              });
+            }
           } finally {
-            await streamAck(
-              redisClient,
-              queues.careerLinks,
-              streamGroups.careerLinks,
-              message.id
-            );
+            if (shouldAck) {
+              await streamAck(
+                redisClient,
+                queues.careerLinks,
+                streamGroups.careerLinks,
+                message.id,
+                streamAckOptions
+              );
+            }
           }
         }
       );
@@ -1409,13 +1674,10 @@ async function runHtmlMongoWorker(args) {
       }
 
       try {
-        const isJobLink =
-          filterJobLinks([jobUrl], {
-            strongPatterns: settings.jobLinkStrongPatterns,
-            weakPatterns: settings.jobLinkWeakPatterns,
-            excludePatterns: settings.jobLinkExcludePatterns
-          }).length > 0;
-        if (!isJobLink) {
+        if (
+          settings.skipNonJobLinksInHtmlWorkers &&
+          !isLikelyJobLink(jobUrl)
+        ) {
           const fetchedAt = new Date();
           await collection.updateOne(
             { url: jobUrl },
@@ -1656,6 +1918,301 @@ async function seedJobLinksToHtmlQueue(args) {
   }
 }
 
+function parseRedisInfoSection(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "string") {
+    return out;
+  }
+  const lines = raw.split(/\r?\n/);
+  for (const line of lines) {
+    if (!line || line[0] === "#") {
+      continue;
+    }
+    const separatorIndex = line.indexOf(":");
+    if (separatorIndex <= 0) {
+      continue;
+    }
+    const key = line.slice(0, separatorIndex).trim();
+    const value = line.slice(separatorIndex + 1).trim();
+    if (!key) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function maskRedisUrl(rawUrl) {
+  if (!rawUrl) {
+    return rawUrl;
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.password) {
+      parsed.password = "***";
+    }
+    return parsed.toString();
+  } catch (error) {
+    return rawUrl;
+  }
+}
+
+function toNumberOrZero(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  return parsed;
+}
+
+async function getStreamHealthSnapshot(redisClient, streamKey, groupName) {
+  const type = await redisClient.type(streamKey);
+  if (type !== "stream") {
+    return {
+      key: streamKey,
+      type,
+      length: 0,
+      groupName,
+      group: null,
+      groups: []
+    };
+  }
+  const [length, groups] = await Promise.all([
+    redisClient.xLen(streamKey),
+    redisClient.xInfoGroups(streamKey).catch(() => [])
+  ]);
+  const normalizedGroups = Array.isArray(groups)
+    ? groups.map((group) => ({
+      name: group.name,
+      consumers: toNumberOrZero(group.consumers),
+      pending: toNumberOrZero(group.pending),
+      lastDeliveredId: group.lastDeliveredId || null
+    }))
+    : [];
+  const currentGroup =
+    normalizedGroups.find((group) => group.name === groupName) || null;
+  return {
+    key: streamKey,
+    type,
+    length: toNumberOrZero(length),
+    groupName,
+    group: currentGroup,
+    groups: normalizedGroups
+  };
+}
+
+async function collectRedisHealth(redisClient) {
+  const [
+    memoryInfoRaw,
+    statsInfoRaw,
+    serverInfoRaw,
+    persistenceInfoRaw,
+    pagesStream,
+    linksStream,
+    dedupeType,
+    retryCounters
+  ] = await Promise.all([
+    redisClient.info("memory"),
+    redisClient.info("stats"),
+    redisClient.info("server"),
+    redisClient.info("persistence"),
+    getStreamHealthSnapshot(
+      redisClient,
+      queues.careerPages,
+      streamGroups.careerPages
+    ),
+    getStreamHealthSnapshot(
+      redisClient,
+      queues.careerLinks,
+      streamGroups.careerLinks
+    ),
+    redisClient.type(queues.careerLinksDedup),
+    redisClient.hGetAll(settings.healthStatsKey).catch(() => ({}))
+  ]);
+  let dedupeSize = 0;
+  if (dedupeType === "set") {
+    dedupeSize = toNumberOrZero(await redisClient.sCard(queues.careerLinksDedup));
+  }
+  const memoryInfo = parseRedisInfoSection(memoryInfoRaw);
+  const statsInfo = parseRedisInfoSection(statsInfoRaw);
+  const serverInfo = parseRedisInfoSection(serverInfoRaw);
+  const persistenceInfo = parseRedisInfoSection(persistenceInfoRaw);
+  const retryStats = {};
+  for (const [key, value] of Object.entries(retryCounters || {})) {
+    retryStats[key] = toNumberOrZero(value);
+  }
+  return {
+    url: maskRedisUrl(redisUrl),
+    memory: {
+      usedMemoryHuman: memoryInfo.used_memory_human || null,
+      usedMemoryPeakHuman: memoryInfo.used_memory_peak_human || null,
+      maxMemoryHuman: memoryInfo.maxmemory_human || null,
+      fragmentationRatio: memoryInfo.mem_fragmentation_ratio || null
+    },
+    stats: {
+      evictedKeys: toNumberOrZero(statsInfo.evicted_keys),
+      expiredKeys: toNumberOrZero(statsInfo.expired_keys),
+      keyspaceHits: toNumberOrZero(statsInfo.keyspace_hits),
+      keyspaceMisses: toNumberOrZero(statsInfo.keyspace_misses)
+    },
+    server: {
+      redisVersion: serverInfo.redis_version || null,
+      uptimeSeconds: toNumberOrZero(serverInfo.uptime_in_seconds),
+      role: serverInfo.role || null
+    },
+    persistence: {
+      aofEnabled: persistenceInfo.aof_enabled || null,
+      rdbLastBgsaveStatus: persistenceInfo.rdb_last_bgsave_status || null
+    },
+    streams: {
+      careerPages: pagesStream,
+      careerLinks: linksStream
+    },
+    dedupe: {
+      key: queues.careerLinksDedup,
+      type: dedupeType,
+      size: dedupeSize
+    },
+    retryStatsKey: settings.healthStatsKey,
+    retryCounters: retryStats
+  };
+}
+
+async function collectMongoHealth(db) {
+  const jobLinksCollection = db.collection(collections.jobLinks);
+  const jobHtmlCollection = db.collection(collections.jobHtml);
+  const baseQuery = {
+    url: { $exists: true, $ne: null }
+  };
+  const [
+    total,
+    pending,
+    processing,
+    done,
+    skipped,
+    error,
+    missingStatus,
+    queuedPending,
+    htmlDocs
+  ] = await Promise.all([
+    jobLinksCollection.countDocuments(baseQuery),
+    jobLinksCollection.countDocuments({ ...baseQuery, htmlStatus: "pending" }),
+    jobLinksCollection.countDocuments({ ...baseQuery, htmlStatus: "processing" }),
+    jobLinksCollection.countDocuments({ ...baseQuery, htmlStatus: "done" }),
+    jobLinksCollection.countDocuments({ ...baseQuery, htmlStatus: "skipped" }),
+    jobLinksCollection.countDocuments({ ...baseQuery, htmlStatus: "error" }),
+    jobLinksCollection.countDocuments({
+      ...baseQuery,
+      htmlStatus: { $exists: false }
+    }),
+    jobLinksCollection.countDocuments({
+      ...baseQuery,
+      htmlQueued: true,
+      htmlStatus: { $nin: ["done", "skipped"] }
+    }),
+    jobHtmlCollection.estimatedDocumentCount()
+  ]);
+  return {
+    database: mongoConfig.database,
+    collections,
+    jobLinks: {
+      total,
+      pending,
+      processing,
+      done,
+      skipped,
+      error,
+      missingStatus,
+      queuedPending
+    },
+    jobHtml: {
+      total: htmlDocs
+    }
+  };
+}
+
+function printHealthReport(report) {
+  const formatInt = (value) => toNumberOrZero(value).toLocaleString("en-US");
+  const redis = report.redis;
+  console.log(`Health Timestamp: ${report.timestamp}`);
+  console.log(`Redis URL: ${redis.url}`);
+  console.log(
+    `Redis Memory: ${redis.memory.usedMemoryHuman} / ${redis.memory.maxMemoryHuman} (peak ${redis.memory.usedMemoryPeakHuman})`
+  );
+  console.log(
+    `Redis Stats: evicted=${formatInt(redis.stats.evictedKeys)} expired=${formatInt(redis.stats.expiredKeys)} hits=${formatInt(redis.stats.keyspaceHits)} misses=${formatInt(redis.stats.keyspaceMisses)}`
+  );
+  for (const stream of [redis.streams.careerPages, redis.streams.careerLinks]) {
+    const group = stream.group || {
+      name: stream.groupName,
+      pending: 0,
+      consumers: 0,
+      lastDeliveredId: null
+    };
+    console.log(
+      `Stream ${stream.key}: len=${formatInt(stream.length)} group=${group.name} pending=${formatInt(group.pending)} consumers=${formatInt(group.consumers)} lastDeliveredId=${group.lastDeliveredId || "n/a"}`
+    );
+  }
+  console.log(
+    `Dedupe Set ${redis.dedupe.key}: type=${redis.dedupe.type} size=${formatInt(redis.dedupe.size)}`
+  );
+  const retryCounters = redis.retryCounters || {};
+  if (Object.keys(retryCounters).length) {
+    console.log(`Retry Counters (${redis.retryStatsKey}):`);
+    for (const [key, value] of Object.entries(retryCounters)) {
+      console.log(`  ${key}: ${formatInt(value)}`);
+    }
+  } else {
+    console.log(`Retry Counters (${redis.retryStatsKey}): empty`);
+  }
+
+  if (report.mongo && !report.mongo.error) {
+    const mongo = report.mongo;
+    console.log(`Mongo DB: ${mongo.database}`);
+    console.log(
+      `Mongo jobLinks: total=${formatInt(mongo.jobLinks.total)} pending=${formatInt(mongo.jobLinks.pending)} processing=${formatInt(mongo.jobLinks.processing)} done=${formatInt(mongo.jobLinks.done)} skipped=${formatInt(mongo.jobLinks.skipped)} error=${formatInt(mongo.jobLinks.error)} missingStatus=${formatInt(mongo.jobLinks.missingStatus)} queuedPending=${formatInt(mongo.jobLinks.queuedPending)}`
+    );
+    console.log(`Mongo jobHtml docs: ${formatInt(mongo.jobHtml.total)}`);
+  } else if (report.mongo && report.mongo.error) {
+    console.log(`Mongo Health Error: ${report.mongo.error}`);
+  }
+}
+
+async function runHealthCommand(args) {
+  const outputJson = parseBoolean(args.json, false);
+  const redisClient = await createRedisClient(redisUrl);
+  let mongoClient = null;
+  try {
+    const redisHealth = await collectRedisHealth(redisClient);
+    let mongoHealth = null;
+    try {
+      const mongoConnection = await connectMongo(
+        mongoConfig.uri,
+        mongoConfig.database
+      );
+      mongoClient = mongoConnection.client;
+      mongoHealth = await collectMongoHealth(mongoConnection.db);
+    } catch (error) {
+      mongoHealth = { error: error.toString() };
+    }
+    const report = {
+      timestamp: new Date().toISOString(),
+      redis: redisHealth,
+      mongo: mongoHealth
+    };
+    if (outputJson) {
+      console.log(JSON.stringify(report, null, 2));
+      return;
+    }
+    printHealthReport(report);
+  } finally {
+    await redisClient.quit();
+    if (mongoClient) {
+      await mongoClient.close();
+    }
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0];
@@ -1671,6 +2228,7 @@ async function main() {
     console.log("  node pipeline/index.js worker:html [--once] [--max <n>] [--source redis|mongo]");
     console.log("  node pipeline/index.js worker:html-mongo [--once] [--max <n>]");
     console.log("       optional: [--retry-errors] [--retry-delay-ms <n>] [--poll-ms <n>] [--lock-ms <n>]");
+    console.log("  node pipeline/index.js health [--json]");
     process.exit(1);
   }
 
@@ -1778,6 +2336,11 @@ async function main() {
 
   if (command === "worker:html-mongo") {
     await runHtmlMongoWorker(args);
+    return;
+  }
+
+  if (command === "health") {
+    await runHealthCommand(args);
     return;
   }
 

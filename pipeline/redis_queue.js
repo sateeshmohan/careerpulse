@@ -289,11 +289,20 @@ async function streamAutoClaimOne(
   };
 }
 
-async function streamAck(client, streamKey, group, id) {
+async function streamAck(client, streamKey, group, id, options = {}) {
   if (!id) {
     return 0;
   }
-  return client.xAck(streamKey, group, id);
+  const acked = await client.xAck(streamKey, group, id);
+  if (!options.deleteMessage || acked <= 0) {
+    return acked;
+  }
+  try {
+    await client.xDel(streamKey, id);
+  } catch (error) {
+    console.error("Redis xDel error:", error);
+  }
+  return acked;
 }
 
 async function saddAndQueue(client, setKey, queueKey, value, queueValue = value) {
