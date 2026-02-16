@@ -255,6 +255,51 @@ const streamSettings = {
       ? Math.max(0, Math.floor(Number(streamConfig.max_retries)))
       : 3
 };
+const streamRetryNonRetryableExtensions = new Set(
+  (
+    process.env.STREAM_NON_RETRYABLE_EXTENSIONS
+      ? process.env.STREAM_NON_RETRYABLE_EXTENSIONS.split(",")
+      : streamConfig.non_retryable_extensions || [
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".csv",
+        ".txt",
+        ".xml",
+        ".rss",
+        ".atom",
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".gif",
+        ".svg",
+        ".webp",
+        ".ico",
+        ".bmp",
+        ".mp3",
+        ".wav",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".wmv",
+        ".mkv",
+        ".exe",
+        ".dmg",
+        ".apk"
+      ]
+  )
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean)
+);
 const retryEnvelopeKeys = {
   payload: "_clf_payload",
   retry: "_clf_retry",
@@ -373,6 +418,92 @@ function buildRetryEnvelopePayload(value, retryCount, firstSeenAt) {
   });
 }
 
+function getUrlFileExtension(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return "";
+  }
+  try {
+    const parsed = new URL(rawUrl);
+    const ext = path.extname(parsed.pathname || "");
+    return String(ext || "").toLowerCase();
+  } catch (error) {
+    return "";
+  }
+}
+
+function extractHttpStatusCode(errorText) {
+  if (!errorText) {
+    return 0;
+  }
+  const match =
+    errorText.match(/response code\s+(\d{3})/i) ||
+    errorText.match(/\bstatus(?:\s+code)?\s*[:=]?\s*(\d{3})\b/i);
+  if (!match) {
+    return 0;
+  }
+  const statusCode = Number(match[1]);
+  if (!Number.isFinite(statusCode)) {
+    return 0;
+  }
+  return statusCode;
+}
+
+function getRetryDecision(error, targetUrl) {
+  const ext = getUrlFileExtension(targetUrl);
+  if (ext && streamRetryNonRetryableExtensions.has(ext)) {
+    return {
+      retryable: false,
+      reason: `non_retryable_extension:${ext}`
+    };
+  }
+
+  const errorText = (error && error.toString ? error.toString() : String(error || ""))
+    .toLowerCase();
+  const statusCode = extractHttpStatusCode(errorText);
+  if (
+    statusCode >= 400 &&
+    statusCode < 500 &&
+    statusCode !== 408 &&
+    statusCode !== 429
+  ) {
+    return {
+      retryable: false,
+      reason: `http_${statusCode}`
+    };
+  }
+
+  if (
+    errorText.includes("invalid url") ||
+    errorText.includes("err_invalid_url") ||
+    errorText.includes("protocol \"mailto:\"") ||
+    errorText.includes("protocol \"tel:\"") ||
+    errorText.includes("protocol \"javascript:\"") ||
+    errorText.includes("unsupported protocol")
+  ) {
+    return {
+      retryable: false,
+      reason: "invalid_or_unsupported_url"
+    };
+  }
+
+  return {
+    retryable: true,
+    reason: "retryable"
+  };
+}
+
+async function incrementHealthCounter(redisClient, field, value = 1) {
+  try {
+    await redisClient.hIncrBy(settings.healthStatsKey, field, value);
+  } catch (error) {
+    log("Health counter update warning.", {
+      key: settings.healthStatsKey,
+      field,
+      error: error.toString()
+    });
+  }
+}
+
 async function retryStreamMessage(
   redisClient,
   streamKey,
@@ -394,19 +525,12 @@ async function retryStreamMessage(
     firstSeenAt
   );
   await streamAdd(redisClient, streamKey, retryPayload);
-  try {
-    await redisClient.hIncrBy(settings.healthStatsKey, "retry_requeued_total", 1);
-    await redisClient.hIncrBy(
-      settings.healthStatsKey,
-      `${streamKey}:retry_requeued`,
-      1
-    );
-  } catch (error) {
-    log("Retry counter update warning.", {
-      stream: streamKey,
-      error: error.toString()
-    });
-  }
+  await incrementHealthCounter(redisClient, "retry_requeued_total", 1);
+  await incrementHealthCounter(
+    redisClient,
+    `${streamKey}:retry_requeued`,
+    1
+  );
   log("Queued stream retry.", {
     stream: streamKey,
     retryCount: nextRetryCount,
@@ -1274,40 +1398,53 @@ async function runLinksWorker(args) {
             shouldAck = true;
           } catch (error) {
             try {
-              const requeued = await retryStreamMessage(
-                redisClient,
-                queues.careerPages,
-                decodedMessage.value,
-                decodedMessage.retryCount,
-                decodedMessage.firstSeenAt,
-                {
-                  id: message.id,
-                  url,
-                  error: error.toString()
-                }
+              const retryDecision = getRetryDecision(
+                error,
+                decodedMessage.value || url
               );
+              const requeued = retryDecision.retryable
+                ? await retryStreamMessage(
+                  redisClient,
+                  queues.careerPages,
+                  decodedMessage.value,
+                  decodedMessage.retryCount,
+                  decodedMessage.firstSeenAt,
+                  {
+                    id: message.id,
+                    url,
+                    error: error.toString()
+                  }
+                )
+                : {
+                  requeued: false,
+                  reason: retryDecision.reason
+                };
               if (requeued.requeued) {
                 shouldAck = true;
                 return;
               }
               if (requeued.reason === "max_retries") {
-                try {
-                  await redisClient.hIncrBy(
-                    settings.healthStatsKey,
-                    "retry_exhausted_total",
-                    1
-                  );
-                  await redisClient.hIncrBy(
-                    settings.healthStatsKey,
-                    `${queues.careerPages}:retry_exhausted`,
-                    1
-                  );
-                } catch (counterError) {
-                  log("Retry exhausted counter warning.", {
-                    stream: queues.careerPages,
-                    error: counterError.toString()
-                  });
-                }
+                await incrementHealthCounter(
+                  redisClient,
+                  "retry_exhausted_total",
+                  1
+                );
+                await incrementHealthCounter(
+                  redisClient,
+                  `${queues.careerPages}:retry_exhausted`,
+                  1
+                );
+              } else if (!retryDecision.retryable) {
+                await incrementHealthCounter(
+                  redisClient,
+                  "retry_skipped_total",
+                  1
+                );
+                await incrementHealthCounter(
+                  redisClient,
+                  `${queues.careerPages}:retry_skipped`,
+                  1
+                );
               }
               await collection.updateOne(
                 { careerUrl: url },
@@ -1317,7 +1454,8 @@ async function runLinksWorker(args) {
               log("Error fetching career links.", {
                 url,
                 error: error.toString(),
-                retryCount: decodedMessage.retryCount
+                retryCount: decodedMessage.retryCount,
+                retryDecision: requeued.reason
               });
               shouldAck = true;
             } catch (handlingError) {
@@ -1504,40 +1642,53 @@ async function runHtmlWorker(args) {
             shouldAck = true;
           } catch (error) {
             try {
-              const requeued = await retryStreamMessage(
-                redisClient,
-                queues.careerLinks,
-                messageValue,
-                decodedMessage.retryCount,
-                decodedMessage.firstSeenAt,
-                {
-                  id: message.id,
-                  url: jobUrl || messageValue,
-                  error: error.toString()
-                }
+              const retryDecision = getRetryDecision(
+                error,
+                jobUrl || messageValue
               );
+              const requeued = retryDecision.retryable
+                ? await retryStreamMessage(
+                  redisClient,
+                  queues.careerLinks,
+                  messageValue,
+                  decodedMessage.retryCount,
+                  decodedMessage.firstSeenAt,
+                  {
+                    id: message.id,
+                    url: jobUrl || messageValue,
+                    error: error.toString()
+                  }
+                )
+                : {
+                  requeued: false,
+                  reason: retryDecision.reason
+                };
               if (requeued.requeued) {
                 shouldAck = true;
                 return;
               }
               if (requeued.reason === "max_retries") {
-                try {
-                  await redisClient.hIncrBy(
-                    settings.healthStatsKey,
-                    "retry_exhausted_total",
-                    1
-                  );
-                  await redisClient.hIncrBy(
-                    settings.healthStatsKey,
-                    `${queues.careerLinks}:retry_exhausted`,
-                    1
-                  );
-                } catch (counterError) {
-                  log("Retry exhausted counter warning.", {
-                    stream: queues.careerLinks,
-                    error: counterError.toString()
-                  });
-                }
+                await incrementHealthCounter(
+                  redisClient,
+                  "retry_exhausted_total",
+                  1
+                );
+                await incrementHealthCounter(
+                  redisClient,
+                  `${queues.careerLinks}:retry_exhausted`,
+                  1
+                );
+              } else if (!retryDecision.retryable) {
+                await incrementHealthCounter(
+                  redisClient,
+                  "retry_skipped_total",
+                  1
+                );
+                await incrementHealthCounter(
+                  redisClient,
+                  `${queues.careerLinks}:retry_skipped`,
+                  1
+                );
               }
               const fallbackUrl = jobUrl || messageValue;
               const fetchedAt = new Date();
@@ -1568,7 +1719,8 @@ async function runHtmlWorker(args) {
               log("Error fetching HTML.", {
                 url: fallbackUrl,
                 error: error.toString(),
-                retryCount: decodedMessage.retryCount
+                retryCount: decodedMessage.retryCount,
+                retryDecision: requeued.reason
               });
               shouldAck = true;
             } catch (handlingError) {

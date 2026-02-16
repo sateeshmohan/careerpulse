@@ -162,6 +162,7 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `STREAM_DELETE_ACKED_MESSAGES`: if `true` (default), remove processed stream entries from Redis after `XACK`.
 - `STREAM_RETRY_ON_ERROR`: if `true` (default), requeue transient stream failures.
 - `STREAM_MAX_RETRIES`: max Redis stream retries before final error persistence (default `3`).
+- `STREAM_NON_RETRYABLE_EXTENSIONS`: comma-separated file extensions that should not be retried (for example `.zip,.pdf,.jpg`).
 - `HEALTH_STATS_KEY`: Redis hash key used to store retry counters for health checks.
 
 ## Mongo Collections and Meaning
