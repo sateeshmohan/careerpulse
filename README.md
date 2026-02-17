@@ -145,6 +145,10 @@ pm2 start pipeline/index.js -i 8 --name worker-html -- worker:html
 - Link data is preserved on link-fetch errors by default (`PRESERVE_LINKS_ON_ERROR=true`).
 - Final links-worker failures are parked in Redis (`career:pages:failed`) for replay.
 - Link arrays can merge across multiple runs (`MERGE_LINKS_ACROSS_RUNS=true`).
+- URL variants are canonicalized for dedupe (for example `http`/`https`, default ports, trailing slash), with `https` preferred when both exist.
+- The crawled career URL (and its `http`/`https` variants) is removed from stored `links` to avoid self-link duplicates.
+- ATS links are canonicalized to main board URLs (for example Lever/Workday/Oracle/ADP), so `atsCareerLinks` does not store job-detail/filter-query variants.
+- Requests rotate across a larger desktop/mobile User-Agent pool to reduce provider-specific blocking.
 - Domain-level exclusions are applied from `expireExcludeDomains.json`.
 - Expired/no-jobs page detection is applied from `expireKeywords.json`.
 - Discovered job links are durably upserted in `career_link_jobs`.
@@ -205,6 +209,12 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `atsFilteredLinkCount`: number of URLs dropped by ATS-link filtering.
 - `excludedDomainPattern`: matched pattern from `expireExcludeDomains.json` when domain exclusion is triggered.
 - `expireKeywordMatches`: matched phrases from `expireKeywords.json` when page appears expired/no-jobs.
+- `requestUrl`: original URL that entered the worker queue.
+- `careerUrl`: canonical URL key for the page (scheme/trailing-slash normalized; prefers `https` when possible).
+- `careerUrlKey`: scheme-insensitive dedupe key used to avoid duplicate docs for redirected variants.
+- `httpStatusCode`: final page HTTP status (for example `200`, `404`).
+- `redirectStatusCodes`: redirect/status chain (for example `[301,200]`).
+- `finalUrl`: resolved destination URL after redirects.
 - `crawlStatus`: `success` | `error`
 
 Quick query for pages with no job links:

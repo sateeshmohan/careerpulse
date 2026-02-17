@@ -1,5 +1,5 @@
 const puppeteer = require("puppeteer");
-const { randomDesktopUserAgent } = require("./user_agents");
+const { isMobileUserAgent, randomUserAgent } = require("./user_agents");
 
 let browserPromise = null;
 
@@ -21,8 +21,41 @@ async function getBrowser(launchOptions = {}) {
 async function withPage(fn, options = {}) {
   const browser = await getBrowser(options.launchOptions);
   const page = await browser.newPage();
-  const userAgent = options.userAgent || randomDesktopUserAgent();
+  const userAgent =
+    options.userAgent ||
+    randomUserAgent({
+      allowMobile: options.allowMobileUserAgent !== false
+    });
+  const mobileUserAgent = isMobileUserAgent(userAgent);
   await page.setUserAgent(userAgent);
+  await page.setViewport(
+    mobileUserAgent
+      ? {
+        width: 390,
+        height: 844,
+        deviceScaleFactor: 2,
+        isMobile: true,
+        hasTouch: true
+      }
+      : {
+        width: 1366,
+        height: 900,
+        deviceScaleFactor: 1,
+        isMobile: false,
+        hasTouch: false
+      }
+  );
+  await page.setExtraHTTPHeaders({
+    "accept-language": "en-US,en;q=0.9",
+    "upgrade-insecure-requests": "1"
+  });
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", {
+      get() {
+        return false;
+      }
+    });
+  });
   await page.setCacheEnabled(false);
 
   if (options.blockResources !== false) {
@@ -487,13 +520,47 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
           text: ""
         }))
       });
+      const redirectChainResponses = [];
+      if (mainResponse) {
+        const mainRequest = mainResponse.request();
+        const redirectRequests =
+          mainRequest && typeof mainRequest.redirectChain === "function"
+            ? mainRequest.redirectChain()
+            : [];
+        for (const request of redirectRequests) {
+          if (!request || typeof request.response !== "function") {
+            continue;
+          }
+          const response = request.response();
+          if (response) {
+            redirectChainResponses.push(response);
+          }
+        }
+        redirectChainResponses.push(mainResponse);
+      }
+      const redirectChain = redirectChainResponses.map((response) => ({
+        url: String(response.url() || ""),
+        statusCode: Number(response.status() || 0),
+        location: String((response.headers() && response.headers().location) || "")
+      }));
+      const redirectStatusCodes = redirectChain
+        .map((step) => Number(step.statusCode || 0))
+        .filter((code) => Number.isFinite(code) && code > 0);
+      const finalResolvedUrl = String(page.url() || "");
+      const redirected =
+        redirectChain.length > 1 ||
+        finalResolvedUrl.toLowerCase() !== String(url || "").toLowerCase();
       return {
         links: mergedState.links,
         linkEntries: mergedState.linkEntries,
         source: "puppeteer",
         userAgent,
         statusCode: mainResponse ? mainResponse.status() : 0,
-        finalUrl: page.url(),
+        finalUrl: finalResolvedUrl,
+        redirectChain,
+        redirectStatusCodes,
+        redirectCount: Math.max(0, redirectChain.length - 1),
+        redirected,
         pageTitle: mergedState.pageTitle,
         pageTextSample: mergedState.pageTextSample
       };

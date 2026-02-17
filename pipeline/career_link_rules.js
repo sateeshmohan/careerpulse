@@ -431,6 +431,173 @@ function hasHardNonCareerTerminal(pathname) {
   return false;
 }
 
+function getPathSegments(pathname) {
+  const raw = String(pathname || "")
+    .split("/")
+    .filter(Boolean);
+  const lower = raw.map((segment) => {
+    try {
+      return decodeURIComponent(String(segment || "")).toLowerCase();
+    } catch (error) {
+      return String(segment || "").toLowerCase();
+    }
+  });
+  return { raw, lower };
+}
+
+function buildCanonicalUrl(parsedUrl, segments = [], options = {}) {
+  const canonical = new URL(parsedUrl.toString());
+  canonical.hash = "";
+  if (/^https?:$/i.test(canonical.protocol)) {
+    canonical.protocol = "https:";
+  }
+  const safeSegments = Array.isArray(segments)
+    ? segments
+      .map((segment) => String(segment || "").trim())
+      .filter(Boolean)
+    : [];
+  canonical.pathname = safeSegments.length ? `/${safeSegments.join("/")}` : "/";
+  if (canonical.pathname !== "/") {
+    canonical.pathname = canonical.pathname.replace(/\/+$/, "");
+  }
+
+  const keepQueryKeys = Array.isArray(options.keepQueryKeys)
+    ? options.keepQueryKeys
+        .map((key) => String(key || "").trim().toLowerCase())
+        .filter(Boolean)
+    : [];
+  if (!keepQueryKeys.length) {
+    canonical.search = "";
+  } else {
+    const nextSearch = new URLSearchParams();
+    const existing = canonical.searchParams;
+    for (const key of keepQueryKeys) {
+      if (!existing.has(key)) {
+        continue;
+      }
+      for (const value of existing.getAll(key)) {
+        nextSearch.append(key, value);
+      }
+    }
+    canonical.search = nextSearch.toString() ? `?${nextSearch.toString()}` : "";
+  }
+  return canonical.toString();
+}
+
+function canonicalizeAtsCareerLink(link) {
+  if (!link) {
+    return "";
+  }
+  let parsed = null;
+  try {
+    parsed = new URL(String(link));
+  } catch (error) {
+    return "";
+  }
+  if (!/^https?:$/i.test(parsed.protocol)) {
+    return "";
+  }
+
+  const host = normalizeHost(parsed.hostname);
+  const { raw: rawSegments, lower: lowerSegments } = getPathSegments(parsed.pathname);
+  const localeSegmentRegex = /^[a-z]{2}(?:-[a-z]{2})?$/i;
+
+  if (host === "jobs.lever.co" || host.endsWith(".jobs.lever.co")) {
+    return buildCanonicalUrl(parsed, rawSegments.length ? [rawSegments[0]] : []);
+  }
+
+  if (matchesDomain(host, "greenhouse.io")) {
+    if (host.startsWith("boards.") || host.startsWith("job-boards.")) {
+      const ignored = new Set(["jobs", "job", "embed", "job_board", "board"]);
+      let companyIndex = 0;
+      while (
+        companyIndex < lowerSegments.length &&
+        ignored.has(lowerSegments[companyIndex])
+      ) {
+        companyIndex += 1;
+      }
+      if (rawSegments[companyIndex]) {
+        return buildCanonicalUrl(parsed, [rawSegments[companyIndex]]);
+      }
+      return buildCanonicalUrl(parsed, []);
+    }
+    if (rawSegments.length && lowerSegments[0] !== "jobs" && lowerSegments[0] !== "job") {
+      return buildCanonicalUrl(parsed, [rawSegments[0]]);
+    }
+    return buildCanonicalUrl(parsed, []);
+  }
+
+  if (matchesDomain(host, "myworkdayjobs.com") || matchesDomain(host, "myworkdaysite.com")) {
+    if (rawSegments.length >= 2 && localeSegmentRegex.test(lowerSegments[0])) {
+      if (lowerSegments[1] === "job" || lowerSegments[1] === "jobs") {
+        return buildCanonicalUrl(parsed, [rawSegments[0]]);
+      }
+      return buildCanonicalUrl(parsed, [rawSegments[0], rawSegments[1]]);
+    }
+    if (rawSegments.length) {
+      if (lowerSegments[0] === "job" || lowerSegments[0] === "jobs") {
+        return buildCanonicalUrl(parsed, []);
+      }
+      return buildCanonicalUrl(parsed, [rawSegments[0]]);
+    }
+    return buildCanonicalUrl(parsed, []);
+  }
+
+  if (
+    (matchesDomain(host, "oraclecloud.com") || matchesDomain(host, "oraclecloudapps.com")) &&
+    lowerSegments.length >= 2 &&
+    lowerSegments[0] === "hcmui" &&
+    lowerSegments[1] === "candidateexperience"
+  ) {
+    if (lowerSegments.length >= 5 && lowerSegments[3] === "sites") {
+      return buildCanonicalUrl(parsed, rawSegments.slice(0, 5));
+    }
+    return buildCanonicalUrl(parsed, rawSegments.slice(0, Math.min(rawSegments.length, 4)));
+  }
+
+  if (
+    matchesDomain(host, "workforcenow.adp.com") &&
+    /recruitment\/recruitment\.html/i.test(parsed.pathname)
+  ) {
+    return buildCanonicalUrl(parsed, rawSegments, {
+      keepQueryKeys: ["cid", "ccid", "type", "lang"]
+    });
+  }
+
+  if (matchesDomain(host, "entertimeonline.com")) {
+    if (rawSegments.length >= 2 && lowerSegments[0] === "ta") {
+      return buildCanonicalUrl(parsed, rawSegments.slice(0, 2));
+    }
+    return buildCanonicalUrl(parsed, rawSegments.slice(0, 1));
+  }
+
+  const genericSegments = rawSegments.slice();
+  if (genericSegments.length >= 2) {
+    const lastLower = lowerSegments[lowerSegments.length - 1];
+    const prevLower = lowerSegments[lowerSegments.length - 2];
+    const looksLikeDetailId =
+      /^[a-f0-9]{8,}$/i.test(lastLower) ||
+      /^[a-f0-9-]{12,}$/i.test(lastLower) ||
+      /^\d{4,}$/.test(lastLower);
+    const detailWords = new Set([
+      "detail",
+      "details",
+      "view",
+      "viewjob",
+      "posting",
+      "position",
+      "opportunity",
+      "opening",
+      "apply"
+    ]);
+    const jobContainerWords = new Set(["job", "jobs", "career", "careers", "opening", "openings"]);
+    if (looksLikeDetailId || detailWords.has(lastLower) || jobContainerWords.has(prevLower)) {
+      genericSegments.pop();
+    }
+  }
+  return buildCanonicalUrl(parsed, genericSegments);
+}
+
 function hasStrongJobSignal(link) {
   const lower = String(link || "").toLowerCase();
   if (!lower) {
@@ -852,7 +1019,12 @@ function filterAtsCareerLinks(links, options = {}) {
       dropped.push({ url: link, reason: "non_career_pattern" });
       continue;
     }
-    kept.push(link);
+    const canonicalAtsLink = canonicalizeAtsCareerLink(link);
+    if (!canonicalAtsLink) {
+      dropped.push({ url: link, reason: "invalid_ats_url" });
+      continue;
+    }
+    kept.push(canonicalAtsLink);
   }
 
   return {
@@ -969,6 +1141,7 @@ function filterLinksByAnchorText(links, linkEntries, options = {}) {
 }
 
 module.exports = {
+  canonicalizeAtsCareerLink,
   detectExpiredOrNoJobs,
   excludedDomainPatterns,
   extractAtsCareerLinks: (links) =>

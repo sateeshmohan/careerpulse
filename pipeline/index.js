@@ -752,10 +752,236 @@ function normalizeLink(link) {
     if (!hashLooksLikeJobRoute) {
       urlObj.hash = "";
     }
+    if (urlObj.pathname && urlObj.pathname !== "/") {
+      urlObj.pathname = urlObj.pathname.replace(/\/+$/, "");
+    }
+    if (
+      (urlObj.protocol === "http:" && urlObj.port === "80") ||
+      (urlObj.protocol === "https:" && urlObj.port === "443")
+    ) {
+      urlObj.port = "";
+    }
     return urlObj.toString();
   } catch (error) {
-    return link;
+    return String(link || "").trim();
   }
+}
+
+function buildLinkDedupeKey(link) {
+  const normalized = normalizeLink(link);
+  if (!normalized) {
+    return "";
+  }
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const port = parsed.port ? `:${parsed.port}` : "";
+    const pathname =
+      parsed.pathname && parsed.pathname !== "/"
+        ? parsed.pathname.replace(/\/+$/, "")
+        : parsed.pathname || "/";
+    return `${host}${port}${pathname}${parsed.search || ""}${parsed.hash || ""}`;
+  } catch (error) {
+    return normalized.toLowerCase().replace(/\/+$/, "");
+  }
+}
+
+function scoreLinkPreference(link) {
+  const normalized = normalizeLink(link);
+  if (!normalized) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  try {
+    const parsed = new URL(normalized);
+    let score = 0;
+    if (parsed.protocol === "https:") {
+      score += 100;
+    }
+    if (parsed.pathname && parsed.pathname !== "/" && !parsed.pathname.endsWith("/")) {
+      score += 10;
+    }
+    if (!parsed.search) {
+      score += 1;
+    }
+    return score;
+  } catch (error) {
+    return 0;
+  }
+}
+
+function selectPreferredLink(current, candidate) {
+  const currentNormalized = normalizeLink(current);
+  const candidateNormalized = normalizeLink(candidate);
+  if (!currentNormalized) {
+    return candidateNormalized;
+  }
+  if (!candidateNormalized) {
+    return currentNormalized;
+  }
+  const currentScore = scoreLinkPreference(currentNormalized);
+  const candidateScore = scoreLinkPreference(candidateNormalized);
+  if (candidateScore > currentScore) {
+    return candidateNormalized;
+  }
+  if (candidateScore < currentScore) {
+    return currentNormalized;
+  }
+  if (candidateNormalized.length < currentNormalized.length) {
+    return candidateNormalized;
+  }
+  if (candidateNormalized.length > currentNormalized.length) {
+    return currentNormalized;
+  }
+  return candidateNormalized < currentNormalized
+    ? candidateNormalized
+    : currentNormalized;
+}
+
+function dedupeLinksPreferHttps(links) {
+  if (!Array.isArray(links) || !links.length) {
+    return [];
+  }
+  const buckets = new Map();
+  for (const link of links) {
+    const normalized = normalizeLink(link);
+    if (!normalized) {
+      continue;
+    }
+    const key = buildLinkDedupeKey(normalized);
+    if (!key) {
+      continue;
+    }
+    const current = buckets.get(key);
+    buckets.set(key, selectPreferredLink(current, normalized));
+  }
+  return Array.from(buckets.values()).filter(Boolean);
+}
+
+function dedupeLinkEntriesPreferHttps(linkEntries) {
+  if (!Array.isArray(linkEntries) || !linkEntries.length) {
+    return [];
+  }
+  const buckets = new Map();
+  for (const entry of linkEntries) {
+    const normalizedUrl = normalizeLink(entry && entry.url);
+    if (!normalizedUrl) {
+      continue;
+    }
+    const key = buildLinkDedupeKey(normalizedUrl);
+    if (!key) {
+      continue;
+    }
+    const text = String((entry && entry.text) || "").trim();
+    if (!buckets.has(key)) {
+      buckets.set(key, {
+        url: normalizedUrl,
+        texts: new Set()
+      });
+    }
+    const bucket = buckets.get(key);
+    bucket.url = selectPreferredLink(bucket.url, normalizedUrl);
+    if (text) {
+      bucket.texts.add(text);
+    }
+  }
+
+  const deduped = [];
+  for (const bucket of buckets.values()) {
+    if (!bucket.texts.size) {
+      deduped.push({
+        url: bucket.url,
+        text: ""
+      });
+      continue;
+    }
+    for (const text of bucket.texts.values()) {
+      deduped.push({
+        url: bucket.url,
+        text
+      });
+    }
+  }
+  return deduped;
+}
+
+function buildCareerLinksDocumentFilter(urlCandidates = []) {
+  const aliasesSet = new Set(
+    (urlCandidates || [])
+      .map((candidate) => normalizeLink(candidate))
+      .filter(Boolean)
+  );
+  for (const alias of Array.from(aliasesSet)) {
+    try {
+      const parsed = new URL(alias);
+      if (!/^https?:$/i.test(parsed.protocol)) {
+        continue;
+      }
+      const httpVariant = new URL(parsed.toString());
+      httpVariant.protocol = "http:";
+      aliasesSet.add(normalizeLink(httpVariant.toString()));
+
+      const httpsVariant = new URL(parsed.toString());
+      httpsVariant.protocol = "https:";
+      aliasesSet.add(normalizeLink(httpsVariant.toString()));
+    } catch (error) {
+      // ignore non-URL values
+    }
+  }
+  const aliases = Array.from(aliasesSet).filter(Boolean);
+  const keyCandidates = Array.from(
+    new Set(aliases.map((url) => buildLinkDedupeKey(url)).filter(Boolean))
+  );
+  const clauses = [];
+  if (keyCandidates.length) {
+    clauses.push({ careerUrlKey: { $in: keyCandidates } });
+  }
+  if (aliases.length) {
+    clauses.push({ careerUrl: { $in: aliases } });
+  }
+  if (!clauses.length) {
+    return {};
+  }
+  if (clauses.length === 1) {
+    return clauses[0];
+  }
+  return { $or: clauses };
+}
+
+function buildSelfLinkKeySet(urlCandidates = []) {
+  const keys = new Set();
+  const normalizedCandidates = Array.from(
+    new Set(
+      (urlCandidates || [])
+        .map((candidate) => normalizeLink(candidate))
+        .filter(Boolean)
+    )
+  );
+  for (const candidate of normalizedCandidates) {
+    const key = buildLinkDedupeKey(candidate);
+    if (key) {
+      keys.add(key);
+    }
+    try {
+      const parsed = new URL(candidate);
+      if (/^https?:$/i.test(parsed.protocol)) {
+        const httpVariant = new URL(parsed.toString());
+        httpVariant.protocol = "http:";
+        const httpKey = buildLinkDedupeKey(httpVariant.toString());
+        if (httpKey) {
+          keys.add(httpKey);
+        }
+        const httpsVariant = new URL(parsed.toString());
+        httpsVariant.protocol = "https:";
+        const httpsKey = buildLinkDedupeKey(httpsVariant.toString());
+        if (httpsKey) {
+          keys.add(httpsKey);
+        }
+      }
+    } catch (error) {
+      // ignore invalid URL variants
+    }
+  }
+  return keys;
 }
 
 function isAtsCareerLink(link) {
@@ -763,11 +989,7 @@ function isAtsCareerLink(link) {
 }
 
 function extractAtsCareerLinks(links) {
-  return Array.from(
-    new Set(
-      extractAtsCareerLinksFromRules(links).map((link) => normalizeLink(link))
-    )
-  );
+  return dedupeLinksPreferHttps(extractAtsCareerLinksFromRules(links));
 }
 
 function filterSameDomain(links, baseUrl) {
@@ -819,7 +1041,7 @@ function applySocialMediaFilter(links, baseUrl) {
 function applyAnchorTextFilter(links, linkEntries) {
   if (!settings.filterNonJobLinksByAnchorText) {
     return {
-      links,
+      links: dedupeLinksPreferHttps(links),
       dropped: []
     };
   }
@@ -831,17 +1053,19 @@ function applyAnchorTextFilter(links, linkEntries) {
     (link) => isLikelyJobLink(link) || isAtsCareerLink(link)
   );
   return {
-    links: Array.from(new Set([...(result.links || []), ...forcedKeep])),
+    links: dedupeLinksPreferHttps([...(result.links || []), ...forcedKeep]),
     dropped: result.dropped || []
   };
 }
 
 function applyCareerLinksFilter(links, forcedLinks = []) {
-  const uniqueInput = Array.from(new Set((links || []).filter(Boolean)));
-  const uniqueForced = Array.from(new Set((forcedLinks || []).filter(Boolean)));
+  const uniqueInput = dedupeLinksPreferHttps((links || []).filter(Boolean));
+  const uniqueForced = dedupeLinksPreferHttps(
+    (forcedLinks || []).filter(Boolean)
+  );
   if (!settings.filterCareerLinks) {
     return {
-      links: Array.from(new Set([...uniqueInput, ...uniqueForced])),
+      links: dedupeLinksPreferHttps([...uniqueInput, ...uniqueForced]),
       dropped: []
     };
   }
@@ -850,13 +1074,13 @@ function applyCareerLinksFilter(links, forcedLinks = []) {
     forceInclude: uniqueForced
   });
   return {
-    links: Array.from(new Set([...(result.links || []), ...uniqueForced])),
+    links: dedupeLinksPreferHttps([...(result.links || []), ...uniqueForced]),
     dropped: result.dropped || []
   };
 }
 
 function applyAtsLinksFilter(links) {
-  const uniqueInput = Array.from(new Set((links || []).filter(Boolean)));
+  const uniqueInput = dedupeLinksPreferHttps((links || []).filter(Boolean));
   if (!settings.filterAtsLinks) {
     return {
       links: uniqueInput,
@@ -867,7 +1091,7 @@ function applyAtsLinksFilter(links) {
     excludePatterns: settings.jobLinkExcludePatterns
   });
   return {
-    links: Array.from(new Set(result.links || [])),
+    links: dedupeLinksPreferHttps(result.links || []),
     dropped: result.dropped || []
   };
 }
@@ -1061,15 +1285,14 @@ async function expandExternalJobBoardJobLinks(careerUrl, jobLinks, candidateLink
     return [];
   }
 
-  const seedCandidates = Array.from(
-    new Set([...(Array.isArray(jobLinks) ? jobLinks : []), ...(Array.isArray(candidateLinks) ? candidateLinks : [])])
-  );
-  const seedLinks = Array.from(
-    new Set(
-      seedCandidates.filter(
-        (link) =>
-          isExternalLinkToCareer(link, careerUrl) && isJobBoardLandingLink(link)
-      )
+  const seedCandidates = dedupeLinksPreferHttps([
+    ...(Array.isArray(jobLinks) ? jobLinks : []),
+    ...(Array.isArray(candidateLinks) ? candidateLinks : [])
+  ]);
+  const seedLinks = dedupeLinksPreferHttps(
+    seedCandidates.filter(
+      (link) =>
+        isExternalLinkToCareer(link, careerUrl) && isJobBoardLandingLink(link)
     )
   ).slice(0, maxSeeds);
   if (!seedLinks.length) {
@@ -1085,13 +1308,12 @@ async function expandExternalJobBoardJobLinks(careerUrl, jobLinks, candidateLink
     fetchedSeeds.add(seedUrl);
     const result = await fetchCareerLinks(seedUrl);
     const seedLinksRaw = Array.isArray(result.links) ? result.links : [];
-    return filterJobLinks(
-      Array.from(new Set(seedLinksRaw.map(normalizeLink))),
-      {
+    return dedupeLinksPreferHttps(
+      filterJobLinks(dedupeLinksPreferHttps(seedLinksRaw), {
         strongPatterns: settings.jobLinkStrongPatterns,
         weakPatterns: settings.jobLinkWeakPatterns,
         excludePatterns: settings.jobLinkExcludePatterns
-      }
+      })
     );
   };
 
@@ -1130,8 +1352,10 @@ async function expandExternalJobBoardJobLinks(careerUrl, jobLinks, candidateLink
     }
   }
 
-  const current = new Set(jobLinks);
-  return Array.from(expanded).filter((link) => !current.has(link));
+  const current = new Set(dedupeLinksPreferHttps(jobLinks).map(buildLinkDedupeKey));
+  return dedupeLinksPreferHttps(Array.from(expanded)).filter(
+    (link) => !current.has(buildLinkDedupeKey(link))
+  );
 }
 
 async function findAnyDocument(collection, query) {
@@ -1178,6 +1402,11 @@ async function ensurePipelineIndexes(db) {
       {
         name: collections.careerLinks,
         key: { careerUrl: 1 },
+        options: {}
+      },
+      {
+        name: collections.careerLinks,
+        key: { careerUrlKey: 1 },
         options: {}
       },
       {
@@ -1264,6 +1493,35 @@ function buildCareerLinksSuccessUpdate(
   );
   const statusCode = Number(analysis.statusCode || 0);
   const finalUrl = String(analysis.finalUrl || "");
+  const requestUrl = String(analysis.requestUrl || careerUrl);
+  const careerUrlKey = String(
+    analysis.careerUrlKey || buildLinkDedupeKey(careerUrl) || ""
+  );
+  const redirectChain = Array.isArray(analysis.redirectChain)
+    ? analysis.redirectChain.slice(0, 20).map((step) => ({
+      url: String((step && step.url) || ""),
+      statusCode: Number((step && step.statusCode) || 0),
+      location: String((step && step.location) || "")
+    }))
+    : [];
+  const redirectStatusCodes = (
+    Array.isArray(analysis.redirectStatusCodes)
+      ? analysis.redirectStatusCodes
+      : redirectChain.map((step) => step.statusCode)
+  )
+    .map((code) => Number(code || 0))
+    .filter((code) => Number.isFinite(code) && code > 0)
+    .slice(0, 20);
+  const redirectCount = Number.isFinite(Number(analysis.redirectCount))
+    ? Math.max(0, Math.floor(Number(analysis.redirectCount)))
+    : Math.max(0, redirectChain.length - 1);
+  const redirected =
+    Boolean(analysis.redirected) ||
+    redirectCount > 0 ||
+    (Boolean(finalUrl) && normalizeLink(finalUrl) !== normalizeLink(careerUrl));
+  const initialHttpStatusCode = redirectStatusCodes.length
+    ? redirectStatusCodes[0]
+    : statusCode;
   const pageTitle = String(analysis.pageTitle || "").slice(0, 300);
   const textFilteredLinkCount = Number(analysis.textFilteredLinkCount || 0);
   const careerFilteredLinkCount = Number(analysis.careerFilteredLinkCount || 0);
@@ -1275,146 +1533,90 @@ function buildCareerLinksSuccessUpdate(
     isExpiredOrNoJobs,
     excludedDomainPattern
   });
-  if (!settings.mergeLinksAcrossRuns) {
-    return {
-      $set: {
-        careerUrl,
-        links,
-        linkCount: links.length,
-        jobLinks,
-        jobLinkCount: jobLinks.length,
-        hasJobLinks,
-        jobDetailLinkCount,
-        hasJobDetailLinks,
-        jobLinksStatus,
-        atsCareerLinks: atsLinks,
-        atsCareerLinkCount: atsLinks.length,
-        hasAtsCareerLinks,
-        careerLinksStatus,
-        expiredOrNoJobs: isExpiredOrNoJobs,
-        expireKeywordMatches,
-        expireKeywordMatchCount,
-        excludedDomainPattern,
-        textFilteredLinkCount,
-        careerFilteredLinkCount,
-        atsFilteredLinkCount,
-        httpStatusCode: statusCode,
-        finalUrl: finalUrl || careerUrl,
-        pageTitle,
-        crawlStatus: "success",
-        source,
-        userAgent,
-        fetchedAt: now,
-        startedAt,
-        lastSuccessAt: now,
-        updatedAt: now,
-        error: null
-      },
-      $setOnInsert: {
-        createdAt: now
-      }
-    };
-  }
-
-  return [
-    {
-      $set: {
-        careerUrl,
-        links: {
-          $setUnion: [{ $ifNull: ["$links", []] }, links]
-        },
-        jobLinks: {
-          $setUnion: [{ $ifNull: ["$jobLinks", []] }, jobLinks]
-        },
-        atsCareerLinks: {
-          $setUnion: [{ $ifNull: ["$atsCareerLinks", []] }, atsLinks]
-        },
-        expiredOrNoJobs: isExpiredOrNoJobs,
-        expireKeywordMatches,
-        expireKeywordMatchCount,
-        excludedDomainPattern,
-        textFilteredLinkCount,
-        careerFilteredLinkCount,
-        atsFilteredLinkCount,
-        httpStatusCode: statusCode,
-        finalUrl: finalUrl || careerUrl,
-        pageTitle,
-        source,
-        userAgent,
-        fetchedAt: now,
-        startedAt,
-        crawlStatus: "success",
-        lastSuccessAt: now,
-        updatedAt: now,
-        error: null,
-        createdAt: { $ifNull: ["$createdAt", now] }
-      }
-    },
-    {
-      $set: {
-        jobDetailLinkCount: buildJobDetailLinkCountExpression("$jobLinks"),
-        linkCount: { $size: "$links" },
-        jobLinkCount: { $size: "$jobLinks" },
-        atsCareerLinkCount: { $size: { $ifNull: ["$atsCareerLinks", []] } },
-        hasJobLinks: { $gt: [{ $size: "$jobLinks" }, 0] },
-        hasJobDetailLinks: {
-          $gt: [buildJobDetailLinkCountExpression("$jobLinks"), 0]
-        },
-        hasAtsCareerLinks: {
-          $gt: [{ $size: { $ifNull: ["$atsCareerLinks", []] } }, 0]
-        },
-        jobLinksStatus: {
-          $cond: [
-            { $gt: [{ $size: "$jobLinks" }, 0] },
-            "job_links_found",
-            "no_job_links"
-          ]
-        },
-        careerLinksStatus: {
-          $cond: [
-            {
-              $gt: [
-                { $strLenCP: { $ifNull: ["$excludedDomainPattern", ""] } },
-                0
-              ]
-            },
-            "excluded_domain",
-            {
-              $cond: [
-                { $gt: [buildJobDetailLinkCountExpression("$jobLinks"), 0] },
-                "job_links_found",
-                {
-                  $cond: [
-                    { $eq: ["$expiredOrNoJobs", true] },
-                    "expired_or_no_jobs",
-                    {
-                      $cond: [
-                        {
-                          $gt: [
-                            { $size: { $ifNull: ["$atsCareerLinks", []] } },
-                            0
-                          ]
-                        },
-                        "ats_career_links_found",
-                        "no_job_links"
-                      ]
-                    }
-                  ]
-                }
-              ]
-            }
-          ]
-        }
-      }
-    }
-  ];
-}
-
-function buildCareerLinksExcludedUpdate(careerUrl, excludedDomainPattern, startedAt) {
-  const now = new Date();
   return {
     $set: {
       careerUrl,
+      careerUrlKey,
+      requestUrl,
+      links,
+      linkCount: links.length,
+      jobLinks,
+      jobLinkCount: jobLinks.length,
+      hasJobLinks,
+      jobDetailLinkCount,
+      hasJobDetailLinks,
+      jobLinksStatus,
+      atsCareerLinks: atsLinks,
+      atsCareerLinkCount: atsLinks.length,
+      hasAtsCareerLinks,
+      careerLinksStatus,
+      expiredOrNoJobs: isExpiredOrNoJobs,
+      expireKeywordMatches,
+      expireKeywordMatchCount,
+      excludedDomainPattern,
+      textFilteredLinkCount,
+      careerFilteredLinkCount,
+      atsFilteredLinkCount,
+      initialHttpStatusCode,
+      httpStatusCode: statusCode,
+      redirectChain,
+      redirectStatusCodes,
+      redirectCount,
+      redirected,
+      finalUrl: finalUrl || careerUrl,
+      pageTitle,
+      crawlStatus: "success",
+      source,
+      userAgent,
+      fetchedAt: now,
+      startedAt,
+      lastSuccessAt: now,
+      updatedAt: now,
+      error: null
+    },
+    $setOnInsert: {
+      createdAt: now
+    }
+  };
+}
+
+function buildCareerLinksExcludedUpdate(
+  careerUrl,
+  excludedDomainPattern,
+  startedAt,
+  options = {}
+) {
+  const now = new Date();
+  const requestUrl = String(options.requestUrl || careerUrl);
+  const finalUrl = String(options.finalUrl || careerUrl);
+  const statusCode = Number(options.statusCode || 0);
+  const redirectChain = Array.isArray(options.redirectChain)
+    ? options.redirectChain.slice(0, 20).map((step) => ({
+      url: String((step && step.url) || ""),
+      statusCode: Number((step && step.statusCode) || 0),
+      location: String((step && step.location) || "")
+    }))
+    : [];
+  const redirectStatusCodes = (
+    Array.isArray(options.redirectStatusCodes)
+      ? options.redirectStatusCodes
+      : redirectChain.map((step) => step.statusCode)
+  )
+    .map((code) => Number(code || 0))
+    .filter((code) => Number.isFinite(code) && code > 0)
+    .slice(0, 20);
+  const redirectCount = Number.isFinite(Number(options.redirectCount))
+    ? Math.max(0, Math.floor(Number(options.redirectCount)))
+    : Math.max(0, redirectChain.length - 1);
+  const redirected =
+    Boolean(options.redirected) ||
+    redirectCount > 0 ||
+    normalizeLink(finalUrl) !== normalizeLink(careerUrl);
+  return {
+    $set: {
+      careerUrl,
+      careerUrlKey: String(options.careerUrlKey || buildLinkDedupeKey(careerUrl) || ""),
+      requestUrl,
       links: [],
       linkCount: 0,
       jobLinks: [],
@@ -1432,6 +1634,15 @@ function buildCareerLinksExcludedUpdate(careerUrl, excludedDomainPattern, starte
       textFilteredLinkCount: 0,
       careerFilteredLinkCount: 0,
       atsFilteredLinkCount: 0,
+      initialHttpStatusCode: redirectStatusCodes.length
+        ? redirectStatusCodes[0]
+        : statusCode,
+      httpStatusCode: statusCode,
+      redirectChain,
+      redirectStatusCodes,
+      redirectCount,
+      redirected,
+      finalUrl: finalUrl || careerUrl,
       crawlStatus: "success",
       jobLinksStatus: "no_job_links",
       careerLinksStatus: "excluded_domain",
@@ -1449,12 +1660,48 @@ function buildCareerLinksExcludedUpdate(careerUrl, excludedDomainPattern, starte
   };
 }
 
-function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
+function buildCareerLinksErrorUpdate(careerUrl, error, startedAt, options = {}) {
   const now = new Date();
+  const requestUrl = String(options.requestUrl || careerUrl);
+  const finalUrl = String(options.finalUrl || careerUrl);
+  const statusCode = Number(options.statusCode || 0);
+  const redirectChain = Array.isArray(options.redirectChain)
+    ? options.redirectChain.slice(0, 20).map((step) => ({
+      url: String((step && step.url) || ""),
+      statusCode: Number((step && step.statusCode) || 0),
+      location: String((step && step.location) || "")
+    }))
+    : [];
+  const redirectStatusCodes = (
+    Array.isArray(options.redirectStatusCodes)
+      ? options.redirectStatusCodes
+      : redirectChain.map((step) => step.statusCode)
+  )
+    .map((code) => Number(code || 0))
+    .filter((code) => Number.isFinite(code) && code > 0)
+    .slice(0, 20);
+  const redirectCount = Number.isFinite(Number(options.redirectCount))
+    ? Math.max(0, Math.floor(Number(options.redirectCount)))
+    : Math.max(0, redirectChain.length - 1);
+  const redirected =
+    Boolean(options.redirected) ||
+    redirectCount > 0 ||
+    normalizeLink(finalUrl) !== normalizeLink(careerUrl);
   if (settings.preserveLinksOnError) {
     return {
       $set: {
         careerUrl,
+        careerUrlKey: String(options.careerUrlKey || buildLinkDedupeKey(careerUrl) || ""),
+        requestUrl,
+        initialHttpStatusCode: redirectStatusCodes.length
+          ? redirectStatusCodes[0]
+          : statusCode,
+        httpStatusCode: statusCode,
+        redirectChain,
+        redirectStatusCodes,
+        redirectCount,
+        redirected,
+        finalUrl: finalUrl || careerUrl,
         crawlStatus: "error",
         jobLinksStatus: "error",
         careerLinksStatus: "error",
@@ -1488,6 +1735,8 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
   return {
     $set: {
       careerUrl,
+      careerUrlKey: String(options.careerUrlKey || buildLinkDedupeKey(careerUrl) || ""),
+      requestUrl,
       links: [],
       linkCount: 0,
       jobLinks: [],
@@ -1505,6 +1754,15 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
       textFilteredLinkCount: 0,
       careerFilteredLinkCount: 0,
       atsFilteredLinkCount: 0,
+      initialHttpStatusCode: redirectStatusCodes.length
+        ? redirectStatusCodes[0]
+        : statusCode,
+      httpStatusCode: statusCode,
+      redirectChain,
+      redirectStatusCodes,
+      redirectCount,
+      redirected,
+      finalUrl: finalUrl || careerUrl,
       crawlStatus: "error",
       jobLinksStatus: "error",
       careerLinksStatus: "error",
@@ -1526,11 +1784,12 @@ async function persistDiscoveredJobLinks(
   jobLinks,
   discoveredAt
 ) {
-  if (!Array.isArray(jobLinks) || !jobLinks.length) {
+  const uniqueJobLinks = dedupeLinksPreferHttps(jobLinks);
+  if (!uniqueJobLinks.length) {
     return 0;
   }
   let total = 0;
-  const batches = chunkArray(jobLinks, settings.mongoBulkWriteBatchSize);
+  const batches = chunkArray(uniqueJobLinks, settings.mongoBulkWriteBatchSize);
   for (const batch of batches) {
     const operations = batch.map((jobUrl) => ({
       updateOne: {
@@ -1571,11 +1830,12 @@ async function enqueueJobLinks(redisClient, careerUrl, jobLinks) {
   if (!settings.enqueueHtmlFromLinksWorker) {
     return 0;
   }
-  if (!Array.isArray(jobLinks) || !jobLinks.length) {
+  const uniqueJobLinks = dedupeLinksPreferHttps(jobLinks);
+  if (!uniqueJobLinks.length) {
     return 0;
   }
   let enqueued = 0;
-  const entries = jobLinks.map((jobUrl) => ({
+  const entries = uniqueJobLinks.map((jobUrl) => ({
     value: jobUrl,
     streamValue: buildQueuePayload(jobUrl, careerUrl)
   }));
@@ -1694,13 +1954,59 @@ async function markMongoHtmlJobState(
   );
 }
 
+function normalizeFetchedLinksResult(result, fallbackUrl = "") {
+  const linkEntries = dedupeLinkEntriesPreferHttps(
+    Array.isArray(result && result.linkEntries) ? result.linkEntries : []
+  );
+  const links = dedupeLinksPreferHttps([
+    ...(Array.isArray(result && result.links) ? result.links : []),
+    ...linkEntries.map((entry) => entry.url)
+  ]);
+  const finalUrlRaw = (result && result.finalUrl) || fallbackUrl;
+  const finalUrl = normalizeLink(finalUrlRaw) || finalUrlRaw;
+  const redirectChain = Array.isArray(result && result.redirectChain)
+    ? result.redirectChain
+      .map((step) => ({
+        url: normalizeLink(step && step.url) || String((step && step.url) || ""),
+        statusCode: Number((step && step.statusCode) || 0),
+        location: String((step && step.location) || "")
+      }))
+      .filter((step) => Boolean(step.url) || step.statusCode > 0)
+    : [];
+  const redirectStatusCodes = (
+    Array.isArray(result && result.redirectStatusCodes)
+      ? result.redirectStatusCodes
+      : redirectChain.map((step) => step.statusCode)
+  )
+    .map((code) => Number(code || 0))
+    .filter((code) => Number.isFinite(code) && code > 0);
+  const redirectCount = Number.isFinite(Number(result && result.redirectCount))
+    ? Math.max(0, Math.floor(Number(result.redirectCount)))
+    : Math.max(0, redirectChain.length - 1);
+  const redirected =
+    Boolean(result && result.redirected) ||
+    redirectCount > 0 ||
+    (Boolean(finalUrl) && normalizeLink(finalUrl) !== normalizeLink(fallbackUrl));
+  return {
+    ...(result || {}),
+    links,
+    linkEntries,
+    finalUrl,
+    redirectChain,
+    redirectStatusCodes,
+    redirectCount,
+    redirected
+  };
+}
+
 async function fetchCareerLinks(url) {
   const buildGotLinksResult = (gotResult) => {
-    const linkEntries = extractLinkEntriesFromHtml(gotResult.html, url, {
+    const rawLinkEntries = extractLinkEntriesFromHtml(gotResult.html, url, {
       sameDomainOnly: false
     });
-    const links = Array.from(
-      new Set(linkEntries.map((entry) => entry.url).filter(Boolean))
+    const linkEntries = dedupeLinkEntriesPreferHttps(rawLinkEntries);
+    const links = dedupeLinksPreferHttps(
+      linkEntries.map((entry) => entry.url).filter(Boolean)
     );
     const pageSignals = extractPageTextSampleFromHtml(gotResult.html, {
       maxLength: settings.expireDetectionTextLimit
@@ -1711,7 +2017,15 @@ async function fetchCareerLinks(url) {
       source: "got",
       userAgent: gotResult.userAgent,
       statusCode: gotResult.statusCode || 0,
-      finalUrl: gotResult.finalUrl || url,
+      finalUrl: normalizeLink(gotResult.finalUrl || url) || gotResult.finalUrl || url,
+      redirectChain: Array.isArray(gotResult.redirectChain)
+        ? gotResult.redirectChain
+        : [],
+      redirectStatusCodes: Array.isArray(gotResult.redirectStatusCodes)
+        ? gotResult.redirectStatusCodes
+        : [],
+      redirectCount: Number(gotResult.redirectCount || 0),
+      redirected: Boolean(gotResult.redirected),
       pageTitle: pageSignals.title || "",
       pageTextSample: pageSignals.textSample || ""
     };
@@ -1722,17 +2036,20 @@ async function fetchCareerLinks(url) {
       timeoutMs: settings.puppeteerTimeoutMs,
       pageTextLimit: settings.expireDetectionTextLimit
     });
-    return {
+    return normalizeFetchedLinksResult(
+      {
       ...puppeteerResult,
       finalUrl: puppeteerResult.finalUrl || url
-    };
+      },
+      url
+    );
   }
 
   if (settings.linksFetchMode === "got") {
     const gotResult = await fetchHtmlWithGot(url, {
       timeoutMs: settings.gotTimeoutMs
     });
-    return buildGotLinksResult(gotResult);
+    return normalizeFetchedLinksResult(buildGotLinksResult(gotResult), url);
   }
 
   let gotResult = null;
@@ -1750,8 +2067,11 @@ async function fetchCareerLinks(url) {
     const hasEnoughLikelyJobs =
       settings.minLikelyJobLinksForGot <= 0 ||
       likelyJobLinks.length >= settings.minLikelyJobLinksForGot;
+    if (Number(gotLinksResult.statusCode || 0) >= 400) {
+      return normalizeFetchedLinksResult(gotLinksResult, url);
+    }
     if (links.length >= settings.minLinksForGot && hasEnoughLikelyJobs) {
-      return gotLinksResult;
+      return normalizeFetchedLinksResult(gotLinksResult, url);
     }
     log("Got did not meet link quality threshold, falling back to puppeteer.", {
       url,
@@ -1771,8 +2091,15 @@ async function fetchCareerLinks(url) {
     timeoutMs: settings.puppeteerTimeoutMs,
     pageTextLimit: settings.expireDetectionTextLimit
   });
-  const initialLinks = Array.isArray(puppeteerResult.links)
-    ? puppeteerResult.links
+  const normalizedPuppeteerResult = normalizeFetchedLinksResult(
+    {
+      ...puppeteerResult,
+      finalUrl: puppeteerResult.finalUrl || url
+    },
+    url
+  );
+  const initialLinks = Array.isArray(normalizedPuppeteerResult.links)
+    ? normalizedPuppeteerResult.links
     : [];
   const initialLikelyJobLinks = filterJobLinks(initialLinks, {
     strongPatterns: settings.jobLinkStrongPatterns,
@@ -1780,14 +2107,23 @@ async function fetchCareerLinks(url) {
     excludePatterns: settings.jobLinkExcludePatterns
   }).length;
   if (initialLinks.length > 1 && initialLikelyJobLinks > 0) {
-    return puppeteerResult;
+    return normalizedPuppeteerResult;
   }
   try {
     const retryResult = await fetchLinksWithPuppeteer(url, {
       timeoutMs: settings.puppeteerTimeoutMs,
       pageTextLimit: settings.expireDetectionTextLimit
     });
-    const retryLinks = Array.isArray(retryResult.links) ? retryResult.links : [];
+    const normalizedRetryResult = normalizeFetchedLinksResult(
+      {
+        ...retryResult,
+        finalUrl: retryResult.finalUrl || url
+      },
+      url
+    );
+    const retryLinks = Array.isArray(normalizedRetryResult.links)
+      ? normalizedRetryResult.links
+      : [];
     const retryLikelyJobLinks = filterJobLinks(retryLinks, {
       strongPatterns: settings.jobLinkStrongPatterns,
       weakPatterns: settings.jobLinkWeakPatterns,
@@ -1805,7 +2141,7 @@ async function fetchCareerLinks(url) {
         initialLikelyJobLinks,
         retryLikelyJobLinks
       });
-      return retryResult;
+      return normalizedRetryResult;
     }
   } catch (error) {
     log("Puppeteer retry failed.", {
@@ -1813,10 +2149,7 @@ async function fetchCareerLinks(url) {
       error: error.toString()
     });
   }
-  return {
-    ...puppeteerResult,
-    finalUrl: puppeteerResult.finalUrl || url
-  };
+  return normalizedPuppeteerResult;
 }
 
 async function fetchPageHtml(url) {
@@ -1858,10 +2191,12 @@ async function fetchPageHtml(url) {
 async function seedFromFile(redisClient, filePath) {
   const resolvedPath = path.resolve(filePath);
   const content = fs.readFileSync(resolvedPath, "utf8");
-  const urls = content
+  const urls = dedupeLinksPreferHttps(
+    content
     .split(/\\r?\\n/)
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+  );
   const batches = chunkArray(urls, settings.redisEnqueueBatchSize);
   for (const batch of batches) {
     await streamAddBatch(redisClient, queues.careerPages, batch);
@@ -1923,7 +2258,7 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
     }
     const now = new Date();
     const validDocs = batch.filter((doc) => Boolean(doc[fieldName]));
-    const urls = validDocs.map((doc) => doc[fieldName]);
+    const urls = dedupeLinksPreferHttps(validDocs.map((doc) => doc[fieldName]));
     if (!urls.length) {
       batch = [];
       return;
@@ -2031,7 +2366,8 @@ async function runLinksWorker(args) {
             return;
           }
           const decodedMessage = decodeStreamMessageValue(message.value);
-          const url = decodedMessage.value;
+          const rawUrl = decodedMessage.value;
+          const url = normalizeLink(rawUrl);
           if (!url) {
             await streamAck(
               redisClient,
@@ -2042,6 +2378,10 @@ async function runLinksWorker(args) {
             );
             return;
           }
+          const sourceCandidateUrls = Array.from(
+            new Set([rawUrl, url].map((candidate) => normalizeLink(candidate)).filter(Boolean))
+          );
+          const sourceFilter = buildCareerLinksDocumentFilter(sourceCandidateUrls);
 
           let shouldAck = false;
           const startedAt = new Date();
@@ -2049,11 +2389,16 @@ async function runLinksWorker(args) {
             const excludedSourceDomain = isExcludedDomain(url);
             if (excludedSourceDomain.excluded) {
               await collection.updateOne(
-                { careerUrl: url },
+                sourceFilter,
                 buildCareerLinksExcludedUpdate(
                   url,
                   excludedSourceDomain.pattern,
-                  startedAt
+                  startedAt,
+                  {
+                    requestUrl: rawUrl,
+                    careerUrlKey: buildLinkDedupeKey(url),
+                    finalUrl: url
+                  }
                 ),
                 { upsert: true }
               );
@@ -2074,77 +2419,93 @@ async function runLinksWorker(args) {
               userAgent,
               statusCode,
               finalUrl,
+              redirectChain,
+              redirectStatusCodes,
+              redirectCount,
+              redirected,
               pageTitle,
               pageTextSample
             } = await fetchCareerLinks(url);
-            const normalizedLinkEntries = Array.from(
+            const canonicalCareerUrl = selectPreferredLink(url, finalUrl || url);
+            const canonicalCandidateUrls = Array.from(
               new Set(
-                (Array.isArray(linkEntries) ? linkEntries : [])
-                  .map((entry) => ({
-                    url: normalizeLink(entry && entry.url),
-                    text: String((entry && entry.text) || "").trim()
-                  }))
-                  .filter((entry) => Boolean(entry.url))
-                  .map((entry) => `${entry.url}\n${entry.text}`)
-              )
-            ).map((value) => {
-              const [entryUrl, ...rest] = value.split("\n");
-              return {
-                url: entryUrl,
-                text: rest.join("\n")
-              };
-            });
-            const rawNormalizedLinks = Array.from(
-              new Set(
-                [
-                  ...(Array.isArray(links) ? links : []),
-                  ...normalizedLinkEntries.map((entry) => entry.url)
-                ]
-                  .map(normalizeLink)
+                [rawUrl, url, canonicalCareerUrl, finalUrl || ""]
+                  .map((candidate) => normalizeLink(candidate))
                   .filter(Boolean)
               )
             );
+            const canonicalFilter = buildCareerLinksDocumentFilter(
+              canonicalCandidateUrls
+            );
+            const canonicalDocFilter =
+              canonicalFilter && Object.keys(canonicalFilter).length
+                ? canonicalFilter
+                : { careerUrl: canonicalCareerUrl };
+            const careerUrlKey = buildLinkDedupeKey(canonicalCareerUrl);
+            const normalizedLinkEntries = dedupeLinkEntriesPreferHttps(
+              (Array.isArray(linkEntries) ? linkEntries : [])
+                .map((entry) => ({
+                  url: entry && entry.url,
+                  text: String((entry && entry.text) || "").trim()
+                }))
+                .filter((entry) => Boolean(entry.url))
+            );
+            const rawNormalizedLinks = dedupeLinksPreferHttps([
+              ...(Array.isArray(links) ? links : []),
+              ...normalizedLinkEntries.map((entry) => entry.url)
+            ]);
             let normalizedLinks = rawNormalizedLinks;
             normalizedLinks = filterSameDomain(normalizedLinks, url);
             normalizedLinks = applySocialMediaFilter(normalizedLinks, url);
-            normalizedLinks = Array.from(new Set(normalizedLinks));
+            normalizedLinks = dedupeLinksPreferHttps(normalizedLinks);
             const textFilterResult = applyAnchorTextFilter(
               normalizedLinks,
               normalizedLinkEntries
             );
             normalizedLinks = textFilterResult.links;
-            let jobLinks = filterJobLinks(normalizedLinks, {
-              strongPatterns: settings.jobLinkStrongPatterns,
-              weakPatterns: settings.jobLinkWeakPatterns,
-              excludePatterns: settings.jobLinkExcludePatterns
-            });
+            let jobLinks = dedupeLinksPreferHttps(
+              filterJobLinks(normalizedLinks, {
+                strongPatterns: settings.jobLinkStrongPatterns,
+                weakPatterns: settings.jobLinkWeakPatterns,
+                excludePatterns: settings.jobLinkExcludePatterns
+              })
+            );
             const expandedJobLinks = await expandExternalJobBoardJobLinks(
               url,
               jobLinks,
               rawNormalizedLinks
             );
             if (expandedJobLinks.length) {
-              jobLinks = Array.from(new Set([...jobLinks, ...expandedJobLinks]));
-              normalizedLinks = Array.from(
-                new Set([...normalizedLinks, ...expandedJobLinks])
-              );
+              jobLinks = dedupeLinksPreferHttps([...jobLinks, ...expandedJobLinks]);
+              normalizedLinks = dedupeLinksPreferHttps([
+                ...normalizedLinks,
+                ...expandedJobLinks
+              ]);
             }
             let jobDetailLinkCount = countJobDetailLinks(jobLinks);
-            let detailJobLinks = jobLinks.filter((link) =>
-              isJobDetailLikeLink(link)
+            let detailJobLinks = dedupeLinksPreferHttps(
+              jobLinks.filter((link) => isJobDetailLikeLink(link))
             );
             const rawAtsCareerLinks = extractAtsCareerLinks(
-              Array.from(new Set([...rawNormalizedLinks, ...normalizedLinks]))
+              dedupeLinksPreferHttps([...rawNormalizedLinks, ...normalizedLinks])
             );
             const atsFilterResult = applyAtsLinksFilter(rawAtsCareerLinks);
             let atsCareerLinks = atsFilterResult.links;
             const careerFilterResult = applyCareerLinksFilter(normalizedLinks, [
-              url,
+              canonicalCareerUrl,
               finalUrl || "",
               ...jobLinks,
               ...atsCareerLinks
             ]);
-            normalizedLinks = careerFilterResult.links;
+            const selfLinkKeys = buildSelfLinkKeySet([
+              rawUrl,
+              url,
+              canonicalCareerUrl,
+              finalUrl || ""
+            ]);
+            normalizedLinks = dedupeLinksPreferHttps(careerFilterResult.links).filter(
+              (link) => !selfLinkKeys.has(buildLinkDedupeKey(link))
+            );
             if (isLikelyBotChallengeResult(rawNormalizedLinks, jobLinks)) {
               throw new Error(
                 "Bot challenge detected while fetching career page; retrying."
@@ -2157,7 +2518,38 @@ async function runLinksWorker(args) {
               jobDetailLinkCount = 0;
               detailJobLinks = [];
               atsCareerLinks = [];
+            } else if (settings.mergeLinksAcrossRuns) {
+              const existingDoc = await collection.findOne(canonicalDocFilter, {
+                projection: {
+                  links: 1,
+                  jobLinks: 1,
+                  atsCareerLinks: 1
+                }
+              });
+              if (existingDoc) {
+                normalizedLinks = dedupeLinksPreferHttps([
+                  ...(Array.isArray(existingDoc.links) ? existingDoc.links : []),
+                  ...normalizedLinks
+                ]);
+                jobLinks = dedupeLinksPreferHttps([
+                  ...(Array.isArray(existingDoc.jobLinks) ? existingDoc.jobLinks : []),
+                  ...jobLinks
+                ]);
+                atsCareerLinks = dedupeLinksPreferHttps([
+                  ...(Array.isArray(existingDoc.atsCareerLinks)
+                    ? existingDoc.atsCareerLinks
+                    : []),
+                  ...atsCareerLinks
+                ]);
+              }
             }
+            normalizedLinks = normalizedLinks.filter(
+              (link) => !selfLinkKeys.has(buildLinkDedupeKey(link))
+            );
+            jobDetailLinkCount = countJobDetailLinks(jobLinks);
+            detailJobLinks = dedupeLinksPreferHttps(
+              jobLinks.filter((link) => isJobDetailLikeLink(link))
+            );
             let expireSignals = {
               isExpiredOrNoJobs: false,
               matchedKeywords: [],
@@ -2184,9 +2576,9 @@ async function runLinksWorker(args) {
             });
 
             await collection.updateOne(
-              { careerUrl: url },
+              canonicalDocFilter,
               buildCareerLinksSuccessUpdate(
-                url,
+                canonicalCareerUrl,
                 normalizedLinks,
                 jobLinks,
                 atsCareerLinks,
@@ -2201,7 +2593,13 @@ async function runLinksWorker(args) {
                     ? finalUrlExcluded.pattern
                     : "",
                   statusCode: statusCode || 0,
-                  finalUrl: finalUrl || url,
+                  requestUrl: rawUrl,
+                  careerUrlKey,
+                  finalUrl: finalUrl || canonicalCareerUrl,
+                  redirectChain,
+                  redirectStatusCodes,
+                  redirectCount,
+                  redirected,
                   pageTitle: pageTitle || "",
                   textFilteredLinkCount: textFilterResult.dropped.length,
                   careerFilteredLinkCount: careerFilterResult.dropped.length,
@@ -2214,13 +2612,13 @@ async function runLinksWorker(args) {
             const discoveredAt = new Date();
             const persistedCount = await persistDiscoveredJobLinks(
               jobLinksCollection,
-              url,
+              canonicalCareerUrl,
               detailJobLinks,
               discoveredAt
             );
             const queuedCount = await enqueueJobLinks(
               redisClient,
-              url,
+              canonicalCareerUrl,
               detailJobLinks
             );
             if (settings.enqueueHtmlFromLinksWorker && detailJobLinks.length) {
@@ -2238,7 +2636,11 @@ async function runLinksWorker(args) {
 
             processed += 1;
             log("Career links fetched.", {
-              url,
+              url: canonicalCareerUrl,
+              sourceUrl: rawUrl,
+              statusCode: statusCode || 0,
+              finalUrl: finalUrl || canonicalCareerUrl,
+              redirectStatusCodes,
               linkCount: normalizedLinks.length,
               jobLinkCount: jobLinks.length,
               jobDetailLinkCount,
@@ -2319,8 +2721,12 @@ async function runLinksWorker(args) {
                 }
               );
               await collection.updateOne(
-                { careerUrl: url },
-                buildCareerLinksErrorUpdate(url, error, startedAt),
+                sourceFilter,
+                buildCareerLinksErrorUpdate(url, error, startedAt, {
+                  requestUrl: rawUrl,
+                  careerUrlKey: buildLinkDedupeKey(url),
+                  finalUrl: url
+                }),
                 { upsert: true }
               );
               log("Error fetching career links.", {
@@ -2882,9 +3288,39 @@ async function seedJobLinksToHtmlQueue(args) {
       batch = [];
       return;
     }
-    let batchQueuedCount = valid.length;
+    const dedupedMap = new Map();
+    for (const doc of valid) {
+      const normalizedUrl = normalizeLink(doc.url);
+      if (!normalizedUrl) {
+        continue;
+      }
+      const dedupeKey = buildLinkDedupeKey(normalizedUrl);
+      if (!dedupeKey) {
+        continue;
+      }
+      if (!dedupedMap.has(dedupeKey)) {
+        dedupedMap.set(dedupeKey, {
+          url: normalizedUrl,
+          careerUrl: doc.careerUrl || ""
+        });
+        continue;
+      }
+      const existing = dedupedMap.get(dedupeKey);
+      existing.url = selectPreferredLink(existing.url, normalizedUrl);
+      if (!existing.careerUrl && doc.careerUrl) {
+        existing.careerUrl = doc.careerUrl;
+      }
+    }
+    const dedupedValid = Array.from(dedupedMap.values()).filter(
+      (doc) => Boolean(doc.url)
+    );
+    if (!dedupedValid.length) {
+      batch = [];
+      return;
+    }
+    let batchQueuedCount = dedupedValid.length;
     if (useDedupe) {
-      const entries = valid.map((doc) => ({
+      const entries = dedupedValid.map((doc) => ({
         value: doc.url,
         streamValue: buildQueuePayload(doc.url, doc.careerUrl)
       }));
@@ -2895,7 +3331,9 @@ async function seedJobLinksToHtmlQueue(args) {
         entries
       );
     } else {
-      const payloads = valid.map((doc) => buildQueuePayload(doc.url, doc.careerUrl));
+      const payloads = dedupedValid.map((doc) =>
+        buildQueuePayload(doc.url, doc.careerUrl)
+      );
       await streamAddBatch(redisClient, queues.careerLinks, payloads);
     }
 
@@ -2917,6 +3355,7 @@ async function seedJobLinksToHtmlQueue(args) {
     totalQueued += batchQueuedCount;
     log("Queued job links batch for html worker.", {
       batchSize: valid.length,
+      dedupedBatchSize: dedupedValid.length,
       queuedInRedis: batchQueuedCount,
       totalQueued
     });
