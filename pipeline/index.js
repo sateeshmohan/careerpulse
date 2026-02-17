@@ -828,6 +828,8 @@ function buildCareerLinksSuccessUpdate(
   startedAt
 ) {
   const now = new Date();
+  const hasJobLinks = jobLinks.length > 0;
+  const jobLinksStatus = hasJobLinks ? "job_links_found" : "no_job_links";
   if (!settings.mergeLinksAcrossRuns) {
     return {
       $set: {
@@ -836,6 +838,9 @@ function buildCareerLinksSuccessUpdate(
         linkCount: links.length,
         jobLinks,
         jobLinkCount: jobLinks.length,
+        hasJobLinks,
+        jobLinksStatus,
+        crawlStatus: "success",
         source,
         userAgent,
         fetchedAt: now,
@@ -864,6 +869,7 @@ function buildCareerLinksSuccessUpdate(
         userAgent,
         fetchedAt: now,
         startedAt,
+        crawlStatus: "success",
         lastSuccessAt: now,
         updatedAt: now,
         error: null,
@@ -873,7 +879,15 @@ function buildCareerLinksSuccessUpdate(
     {
       $set: {
         linkCount: { $size: "$links" },
-        jobLinkCount: { $size: "$jobLinks" }
+        jobLinkCount: { $size: "$jobLinks" },
+        hasJobLinks: { $gt: [{ $size: "$jobLinks" }, 0] },
+        jobLinksStatus: {
+          $cond: [
+            { $gt: [{ $size: "$jobLinks" }, 0] },
+            "job_links_found",
+            "no_job_links"
+          ]
+        }
       }
     }
   ];
@@ -885,6 +899,8 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
     return {
       $set: {
         careerUrl,
+        crawlStatus: "error",
+        jobLinksStatus: "error",
         error: error.toString(),
         lastErrorAt: now,
         fetchedAt: now,
@@ -907,6 +923,9 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
       linkCount: 0,
       jobLinks: [],
       jobLinkCount: 0,
+      hasJobLinks: false,
+      crawlStatus: "error",
+      jobLinksStatus: "error",
       error: error.toString(),
       lastErrorAt: now,
       fetchedAt: now,

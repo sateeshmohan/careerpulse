@@ -172,6 +172,15 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `career_link_jobs`: one document per job `url`, tracks discovery metadata and HTML processing lifecycle.
 - `career_html`: one document per job `url`, stores parsed output for job pages.
 
+`career_links` status fields:
+- `jobLinksStatus`: `job_links_found` | `no_job_links` | `error`
+- `crawlStatus`: `success` | `error`
+
+Quick query for pages with no job links:
+```js
+db.career_links.find({ jobLinksStatus: "no_job_links", crawlStatus: "success" })
+```
+
 ## Optional Redis HTML Mode Notes
 
 Redis HTML queue mode is supported, but for very large delayed runs Mongo HTML mode is safer because job state is durable in Mongo.
