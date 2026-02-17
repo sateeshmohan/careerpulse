@@ -86,6 +86,7 @@ function buildAdpJobDetailLink(careerUrl, jobId) {
 
 async function fetchLinksWithPuppeteer(url, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
+  const pageTextLimit = Number(options.pageTextLimit || 60000);
   return withPage(
     async (page, userAgent) => {
       const responseDerivedLinks = new Set();
@@ -123,8 +124,58 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
         task.finally(() => responseTasks.delete(task));
       });
 
+      const dedupeEntries = (entries) => {
+        const seen = new Set();
+        const out = [];
+        for (const entry of entries || []) {
+          if (!entry || !entry.url) {
+            continue;
+          }
+          const urlValue = String(entry.url).trim();
+          if (!urlValue) {
+            continue;
+          }
+          const textValue = String(entry.text || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 240);
+          const key = `${urlValue}\n${textValue}`;
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          out.push({
+            url: urlValue,
+            text: textValue
+          });
+        }
+        return out;
+      };
+
+      const mergeCollections = (base, incoming) => {
+        const mergedEntries = dedupeEntries([
+          ...((base && base.linkEntries) || []),
+          ...((incoming && incoming.linkEntries) || [])
+        ]);
+        const mergedLinks = Array.from(
+          new Set(mergedEntries.map((entry) => entry.url))
+        );
+        return {
+          links: mergedLinks,
+          linkEntries: mergedEntries,
+          pageTitle:
+            (incoming && incoming.pageTitle) ||
+            (base && base.pageTitle) ||
+            "",
+          pageTextSample:
+            (incoming && incoming.pageTextSample) ||
+            (base && base.pageTextSample) ||
+            ""
+        };
+      };
+
       const collectLinks = async () => {
-        const mainLinks = await page.evaluate(() => {
+        const mainResult = await page.evaluate((maxTextLength) => {
           const toAbsolute = (value) => {
             if (!value || typeof value !== "string") {
               return "";
@@ -158,68 +209,105 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
             }
             return links;
           };
-
-          const anchors = Array.from(document.querySelectorAll("a[href]"))
-            .flatMap((anchor) => {
-              const out = [];
-              if (
-                anchor.href &&
-                !String(anchor.href).toLowerCase().startsWith("javascript:")
-              ) {
-                out.push(anchor.href);
+          const entries = [];
+          const addEntry = (candidateUrl, text) => {
+            const absolute = toAbsolute(candidateUrl);
+            if (!absolute) {
+              return;
+            }
+            entries.push({
+              url: absolute,
+              text: String(text || "")
+            });
+          };
+          Array.from(document.querySelectorAll("a[href]")).forEach((anchor) => {
+            const anchorText = (
+              anchor.textContent ||
+              anchor.getAttribute("aria-label") ||
+              anchor.getAttribute("title") ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+            if (
+              anchor.href &&
+              !String(anchor.href).toLowerCase().startsWith("javascript:")
+            ) {
+              addEntry(anchor.href, anchorText);
+            }
+            const rawHref = anchor.getAttribute("href");
+            if (
+              rawHref &&
+              typeof rawHref === "string" &&
+              rawHref.trim().toLowerCase().startsWith("javascript:")
+            ) {
+              const inlineLinks = extractInlineLinksFromHandler(rawHref);
+              for (const inlineLink of inlineLinks) {
+                addEntry(inlineLink, anchorText);
               }
-              const rawHref = anchor.getAttribute("href");
-              if (
-                rawHref &&
-                typeof rawHref === "string" &&
-                rawHref.trim().toLowerCase().startsWith("javascript:")
-              ) {
-                out.push(...extractInlineLinksFromHandler(rawHref));
-              }
-              return out;
-            })
-            .filter((href) => href);
-          const embeddedSources = Array.from(
-            document.querySelectorAll("iframe[src],frame[src]")
-          )
-            .map((element) => element.src)
-            .filter((src) => src);
+            }
+          });
+          Array.from(document.querySelectorAll("iframe[src],frame[src]")).forEach(
+            (element) => {
+              addEntry(element.src, "");
+            }
+          );
           const dataUrlAttributes = [
             "data-href",
             "data-url",
             "data-link",
             "data-job-url"
           ];
-          const dataAttributeLinks = [];
           for (const selector of dataUrlAttributes) {
             document.querySelectorAll(`[${selector}]`).forEach((element) => {
               const raw = element.getAttribute(selector);
-              const absolute = toAbsolute(raw);
-              if (absolute) {
-                dataAttributeLinks.push(absolute);
-              }
+              const elementText = (
+                element.textContent ||
+                element.getAttribute("aria-label") ||
+                element.getAttribute("title") ||
+                ""
+              )
+                .replace(/\s+/g, " ")
+                .trim();
+              addEntry(raw, elementText);
             });
           }
-          const inlineHandlerLinks = [];
           document.querySelectorAll("[onclick],[onkeydown]").forEach((element) => {
-            inlineHandlerLinks.push(
+            const elementText = (
+              element.textContent ||
+              element.getAttribute("aria-label") ||
+              element.getAttribute("title") ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+            const extracted = [
               ...extractInlineLinksFromHandler(element.getAttribute("onclick")),
               ...extractInlineLinksFromHandler(element.getAttribute("onkeydown"))
-            );
+            ];
+            for (const inlineLink of extracted) {
+              addEntry(inlineLink, elementText);
+            }
           });
-          return anchors.concat(
-            embeddedSources,
-            dataAttributeLinks,
-            inlineHandlerLinks
-          );
-        });
-        const frameLinks = [];
+          const pageTextSample = String(
+            (document.body && document.body.innerText) || ""
+          )
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, maxTextLength);
+          return {
+            entries,
+            pageTitle: String(document.title || ""),
+            pageTextSample
+          };
+        }, pageTextLimit);
+        const frameEntries = [];
         const frames = page.frames();
         for (const frame of frames) {
           try {
             const frameUrl = frame.url();
             if (frameUrl && frameUrl !== "about:blank") {
-              frameLinks.push(frameUrl);
+              frameEntries.push({ url: frameUrl, text: "" });
             }
             const links = await frame.$$eval("a[href]", (anchors) => {
               const toAbsolute = (value) => {
@@ -258,35 +346,56 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
                 }
                 return links;
               };
-              return anchors
-                .flatMap((anchor) => {
-                  const out = [];
-                  if (
-                    anchor.href &&
-                    !String(anchor.href).toLowerCase().startsWith("javascript:")
-                  ) {
-                    out.push(anchor.href);
+              return anchors.flatMap((anchor) => {
+                const out = [];
+                const anchorText = (
+                  anchor.textContent ||
+                  anchor.getAttribute("aria-label") ||
+                  anchor.getAttribute("title") ||
+                  ""
+                )
+                  .replace(/\s+/g, " ")
+                  .trim();
+                if (
+                  anchor.href &&
+                  !String(anchor.href).toLowerCase().startsWith("javascript:")
+                ) {
+                  out.push({ url: anchor.href, text: anchorText });
+                }
+                const rawHref = anchor.getAttribute("href");
+                if (
+                  rawHref &&
+                  typeof rawHref === "string" &&
+                  rawHref.trim().toLowerCase().startsWith("javascript:")
+                ) {
+                  const inlineLinks = extractInlineLinksFromHandler(rawHref);
+                  for (const inlineLink of inlineLinks) {
+                    const absolute = toAbsolute(inlineLink);
+                    if (absolute) {
+                      out.push({ url: absolute, text: anchorText });
+                    }
                   }
-                  const rawHref = anchor.getAttribute("href");
-                  if (
-                    rawHref &&
-                    typeof rawHref === "string" &&
-                    rawHref.trim().toLowerCase().startsWith("javascript:")
-                  ) {
-                    out.push(...extractInlineLinksFromHandler(rawHref));
-                  }
-                  return out;
-                })
-                .filter(Boolean);
+                }
+                return out;
+              });
             });
             if (Array.isArray(links) && links.length) {
-              frameLinks.push(...links);
+              frameEntries.push(...links);
             }
           } catch (error) {
             // Ignore detached/cross-origin frame failures and continue.
           }
         }
-        return Array.from(new Set([...(mainLinks || []), ...frameLinks]));
+        const mergedEntries = dedupeEntries([
+          ...((mainResult && mainResult.entries) || []),
+          ...frameEntries
+        ]);
+        return {
+          links: Array.from(new Set(mergedEntries.map((entry) => entry.url))),
+          linkEntries: mergedEntries,
+          pageTitle: (mainResult && mainResult.pageTitle) || "",
+          pageTextSample: (mainResult && mainResult.pageTextSample) || ""
+        };
       };
 
       const waitForDynamicLinksIfSparse = async (currentLinks) => {
@@ -298,19 +407,27 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
           }
         })();
         const isWorkdayHost = host.includes("myworkdayjobs.com");
-        const hasJobLikeLink = currentLinks.some((link) =>
+        const lowerUrl = String(url || "").toLowerCase();
+        const isOracleCandidateExperience =
+          host.includes("oraclecloud.com") &&
+          lowerUrl.includes("/hcmui/candidateexperience/");
+        const currentUrls = Array.isArray(currentLinks && currentLinks.links)
+          ? currentLinks.links
+          : [];
+        const hasJobLikeLink = currentUrls.some((link) =>
           /\/job\/|\/jobs\/|jobdetails|requisition|opening|position|apply/i.test(
             String(link || "")
           )
         );
         const shouldRetry =
-          currentLinks.length <= 1 ||
-          (currentLinks.length <= 10 && !hasJobLikeLink) ||
-          (isWorkdayHost && !hasJobLikeLink);
+          currentUrls.length <= 1 ||
+          (currentUrls.length <= 10 && !hasJobLikeLink) ||
+          (isWorkdayHost && !hasJobLikeLink) ||
+          (isOracleCandidateExperience && !hasJobLikeLink);
         if (!shouldRetry) {
           return currentLinks;
         }
-        const waitMs = isWorkdayHost
+        const waitMs = isWorkdayHost || isOracleCandidateExperience
           ? Math.min(12000, Math.max(4000, Math.floor(timeoutMs / 6)))
           : Math.min(5000, Math.max(1000, Math.floor(timeoutMs / 10)));
         try {
@@ -334,20 +451,20 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
           // Ignore wait timeout and keep current links.
         }
         const refreshedLinks = await collectLinks();
-        if (!isWorkdayHost) {
-          return refreshedLinks.length ? refreshedLinks : currentLinks;
+        if (!isWorkdayHost && !isOracleCandidateExperience) {
+          return refreshedLinks.links.length ? refreshedLinks : currentLinks;
         }
-        const refreshedHasJobLikeLink = refreshedLinks.some((link) =>
+        const refreshedHasJobLikeLink = refreshedLinks.links.some((link) =>
           /\/job\/|\/jobs\/|jobdetails|requisition|opening|position|apply/i.test(
             String(link || "")
           )
         );
-        if (refreshedHasJobLikeLink || refreshedLinks.length > 10) {
+        if (refreshedHasJobLikeLink || refreshedLinks.links.length > 10) {
           return refreshedLinks;
         }
         await new Promise((resolve) => setTimeout(resolve, 1500));
         const finalLinks = await collectLinks();
-        return finalLinks.length ? finalLinks : refreshedLinks;
+        return finalLinks.links.length ? finalLinks : refreshedLinks;
       };
 
       const waitForResponseTasks = async () => {
@@ -357,20 +474,28 @@ async function fetchLinksWithPuppeteer(url, options = {}) {
         await Promise.allSettled(Array.from(responseTasks));
       };
 
-      await page.goto(url, {
+      const mainResponse = await page.goto(url, {
         waitUntil: "networkidle2",
         timeout: timeoutMs
       });
       const initialLinks = await collectLinks();
-      const links = await waitForDynamicLinksIfSparse(initialLinks);
+      const linksState = await waitForDynamicLinksIfSparse(initialLinks);
       await waitForResponseTasks();
-      const mergedLinks = Array.from(
-        new Set([...(links || []), ...Array.from(responseDerivedLinks)])
-      );
+      const mergedState = mergeCollections(linksState, {
+        linkEntries: Array.from(responseDerivedLinks).map((link) => ({
+          url: link,
+          text: ""
+        }))
+      });
       return {
-        links: mergedLinks,
+        links: mergedState.links,
+        linkEntries: mergedState.linkEntries,
         source: "puppeteer",
-        userAgent
+        userAgent,
+        statusCode: mainResponse ? mainResponse.status() : 0,
+        finalUrl: page.url(),
+        pageTitle: mergedState.pageTitle,
+        pageTextSample: mergedState.pageTextSample
       };
     },
     {

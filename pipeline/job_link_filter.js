@@ -93,6 +93,9 @@ function isLikelyJobLink(link, options = {}) {
   if (/jobcode=0(?:[^0-9]|$)/.test(lower)) {
     return false;
   }
+  if (/\/jobs?(?:\/|$|\?)/.test(lower)) {
+    return true;
+  }
   const strongPatterns =
     normalizePatterns(options.strongPatterns) ||
     normalizePatterns(DEFAULT_STRONG_PATTERNS);

@@ -145,6 +145,8 @@ pm2 start pipeline/index.js -i 8 --name worker-html -- worker:html
 - Link data is preserved on link-fetch errors by default (`PRESERVE_LINKS_ON_ERROR=true`).
 - Final links-worker failures are parked in Redis (`career:pages:failed`) for replay.
 - Link arrays can merge across multiple runs (`MERGE_LINKS_ACROSS_RUNS=true`).
+- Domain-level exclusions are applied from `expireExcludeDomains.json`.
+- Expired/no-jobs page detection is applied from `expireKeywords.json`.
 - Discovered job links are durably upserted in `career_link_jobs`.
 - HTML processing state is tracked in Mongo: `pending`, `processing`, `done`, `skipped`, `error`.
 - Mongo HTML worker uses lock fields (`htmlLockBy`, `htmlLockUntil`) to coordinate multiple servers safely.
@@ -161,6 +163,14 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `MIN_LIKELY_JOB_LINKS_FOR_GOT`: in `auto` mode, minimum likely job links required to accept Got result before Puppeteer fallback.
 - `EXPAND_EXTERNAL_JOB_BOARD_LINKS`: when enabled, expand external career-home links (for example Paycor/Workday boards) to collect job-detail links.
 - `JOB_BOARD_EXPANSION_MAX_SEEDS`: maximum external job-board seed links expanded per career page crawl.
+- `FILTER_NON_JOB_LINKS_BY_ANCHOR_TEXT`: if `true` (default), drops links with non-job anchor text (for example Contact/FAQ/About/Help) while preserving ATS and likely-job links.
+- `FILTER_CAREER_LINKS`: if `true` (default), filters stored `links` to career/job-like URLs and removes obvious non-career URLs.
+- `FILTER_ATS_LINKS`: if `true` (default), filters `atsCareerLinks` to ATS career/job URLs and drops ATS non-job pages (for example privacy/help/about pages).
+- `NON_JOB_ANCHOR_TEXT_PATTERNS`: custom non-job text phrases used by the anchor-text filter.
+- `POSITIVE_JOB_ANCHOR_TEXT_PATTERNS`: text patterns that force links to be kept as job-relevant.
+- `ENABLE_EXPIRE_KEYWORD_DETECTION`: detect expired/no-jobs pages using `expireKeywords.json`.
+- `EXPIRE_KEYWORD_MATCH_LIMIT`: max keyword matches saved per page.
+- `EXPIRE_DETECTION_TEXT_LIMIT`: max page text characters scanned for expire/no-jobs detection.
 - `JOB_LINK_STRONG_PATTERNS`: include provider-specific markers (for example AppOne `jobcode=`) when needed.
 - `JOB_LINK_EXCLUDE_PATTERNS`: use this to suppress non-job actions (for example `emailme.asp`, `jobcode=0`).
 - `REDIS_ENQUEUE_BATCH_SIZE`: Redis enqueue batch size.
@@ -188,11 +198,33 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 
 `career_links` status fields:
 - `jobLinksStatus`: `job_links_found` | `no_job_links` | `error`
+- `careerLinksStatus`: `job_links_found` | `ats_career_links_found` | `expired_or_no_jobs` | `excluded_domain` | `no_job_links` | `error`
+- `jobDetailLinkCount`: count of detail-like job URLs (for example `/job/123`, `jobId=...`)
+- `atsCareerLinks`: detected ATS career-board links (Workday, Oracle CE, ADP, Entertime, etc.)
+- `careerFilteredLinkCount`: number of URLs dropped by career-link URL filtering.
+- `atsFilteredLinkCount`: number of URLs dropped by ATS-link filtering.
+- `excludedDomainPattern`: matched pattern from `expireExcludeDomains.json` when domain exclusion is triggered.
+- `expireKeywordMatches`: matched phrases from `expireKeywords.json` when page appears expired/no-jobs.
 - `crawlStatus`: `success` | `error`
 
 Quick query for pages with no job links:
 ```js
 db.career_links.find({ jobLinksStatus: "no_job_links", crawlStatus: "success" })
+```
+
+Quick query for pages where ATS board was found but no direct job detail links yet:
+```js
+db.career_links.find({ careerLinksStatus: "ats_career_links_found", crawlStatus: "success" })
+```
+
+Quick query for pages excluded by domain rules:
+```js
+db.career_links.find({ careerLinksStatus: "excluded_domain", crawlStatus: "success" })
+```
+
+Quick query for pages classified as expired/no-jobs:
+```js
+db.career_links.find({ careerLinksStatus: "expired_or_no_jobs", crawlStatus: "success" })
 ```
 
 ## Optional Redis HTML Mode Notes

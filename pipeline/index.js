@@ -4,7 +4,10 @@ const { URL } = require("url");
 const config = require("config");
 
 const { fetchHtmlWithGot } = require("./http_client");
-const { extractLinksFromHtml } = require("./link_extractor");
+const {
+  extractLinkEntriesFromHtml,
+  extractPageTextSampleFromHtml
+} = require("./link_extractor");
 const {
   fetchLinksWithPuppeteer,
   fetchHtmlWithPuppeteer,
@@ -26,6 +29,15 @@ const { extractJobPostingFromHtml } = require("./ldjson_extractor");
 const parseLdJson = require("../ldjson_parser");
 const { deleteSocialMediaUrls } = require("../delete_socialmedia_links");
 const { filterJobLinks } = require("./job_link_filter");
+const {
+  detectExpiredOrNoJobs,
+  extractAtsCareerLinks: extractAtsCareerLinksFromRules,
+  filterAtsCareerLinks: filterAtsCareerLinksFromRules,
+  filterCareerLinks: filterCareerLinksFromRules,
+  filterLinksByAnchorText,
+  isAtsCareerLink: isAtsCareerLinkFromRules,
+  isExcludedDomain
+} = require("./career_link_rules");
 
 const getConfig = (key, fallback) => {
   try {
@@ -129,6 +141,24 @@ const settings = {
     pipelineConfig.job_board_expansion_max_seeds ||
     1
   ),
+  filterNonJobLinksByAnchorText: parseBoolean(
+    process.env.FILTER_NON_JOB_LINKS_BY_ANCHOR_TEXT,
+    pipelineConfig.filter_non_job_links_by_anchor_text !== undefined
+      ? pipelineConfig.filter_non_job_links_by_anchor_text
+      : true
+  ),
+  filterCareerLinks: parseBoolean(
+    process.env.FILTER_CAREER_LINKS,
+    pipelineConfig.filter_career_links !== undefined
+      ? pipelineConfig.filter_career_links
+      : true
+  ),
+  filterAtsLinks: parseBoolean(
+    process.env.FILTER_ATS_LINKS,
+    pipelineConfig.filter_ats_links !== undefined
+      ? pipelineConfig.filter_ats_links
+      : true
+  ),
   linksFetchMode: parseFetchMode(
     process.env.LINKS_FETCH_MODE ||
       pipelineConfig.links_fetch_mode ||
@@ -168,6 +198,32 @@ const settings = {
     (process.env.JOB_LINK_EXCLUDE_PATTERNS
       ? process.env.JOB_LINK_EXCLUDE_PATTERNS.split("|")
       : undefined),
+  nonJobAnchorTextPatterns:
+    pipelineConfig.non_job_anchor_text_patterns ||
+    (process.env.NON_JOB_ANCHOR_TEXT_PATTERNS
+      ? process.env.NON_JOB_ANCHOR_TEXT_PATTERNS.split("|")
+      : undefined),
+  positiveJobAnchorTextPatterns:
+    pipelineConfig.positive_job_anchor_text_patterns ||
+    (process.env.POSITIVE_JOB_ANCHOR_TEXT_PATTERNS
+      ? process.env.POSITIVE_JOB_ANCHOR_TEXT_PATTERNS.split("|")
+      : undefined),
+  enableExpireKeywordDetection: parseBoolean(
+    process.env.ENABLE_EXPIRE_KEYWORD_DETECTION,
+    pipelineConfig.enable_expire_keyword_detection !== undefined
+      ? pipelineConfig.enable_expire_keyword_detection
+      : true
+  ),
+  expireKeywordMatchLimit: Number(
+    process.env.EXPIRE_KEYWORD_MATCH_LIMIT ||
+      pipelineConfig.expire_keyword_match_limit ||
+      8
+  ),
+  expireDetectionTextLimit: Number(
+    process.env.EXPIRE_DETECTION_TEXT_LIMIT ||
+      pipelineConfig.expire_detection_text_limit ||
+      60000
+  ),
   enqueueHtmlFromLinksWorker: parseBoolean(
     process.env.ENQUEUE_HTML_FROM_LINKS_WORKER,
     pipelineConfig.enqueue_html_from_links_worker !== undefined
@@ -702,6 +758,18 @@ function normalizeLink(link) {
   }
 }
 
+function isAtsCareerLink(link) {
+  return isAtsCareerLinkFromRules(link);
+}
+
+function extractAtsCareerLinks(links) {
+  return Array.from(
+    new Set(
+      extractAtsCareerLinksFromRules(links).map((link) => normalizeLink(link))
+    )
+  );
+}
+
 function filterSameDomain(links, baseUrl) {
   if (!settings.sameDomainOnly) {
     return links;
@@ -718,8 +786,16 @@ function filterSameDomain(links, baseUrl) {
       if (baseHost === host) {
         return true;
       }
-      if (settings.keepExternalLikelyJobLinks && isLikelyJobLink(link)) {
-        return true;
+      if (settings.keepExternalLikelyJobLinks) {
+        if (isLikelyJobLink(link)) {
+          return true;
+        }
+        if (isJobBoardLandingLink(link)) {
+          return true;
+        }
+        if (isAtsCareerLink(link)) {
+          return true;
+        }
       }
       return false;
     } catch (error) {
@@ -738,6 +814,62 @@ function applySocialMediaFilter(links, baseUrl) {
   const dataset = links.map((url) => ({ url }));
   const filtered = deleteSocialMediaUrls(dataset, domain);
   return filtered.map((item) => item.url).filter(Boolean);
+}
+
+function applyAnchorTextFilter(links, linkEntries) {
+  if (!settings.filterNonJobLinksByAnchorText) {
+    return {
+      links,
+      dropped: []
+    };
+  }
+  const result = filterLinksByAnchorText(links, linkEntries, {
+    nonJobPatterns: settings.nonJobAnchorTextPatterns,
+    positivePatterns: settings.positiveJobAnchorTextPatterns
+  });
+  const forcedKeep = (links || []).filter(
+    (link) => isLikelyJobLink(link) || isAtsCareerLink(link)
+  );
+  return {
+    links: Array.from(new Set([...(result.links || []), ...forcedKeep])),
+    dropped: result.dropped || []
+  };
+}
+
+function applyCareerLinksFilter(links, forcedLinks = []) {
+  const uniqueInput = Array.from(new Set((links || []).filter(Boolean)));
+  const uniqueForced = Array.from(new Set((forcedLinks || []).filter(Boolean)));
+  if (!settings.filterCareerLinks) {
+    return {
+      links: Array.from(new Set([...uniqueInput, ...uniqueForced])),
+      dropped: []
+    };
+  }
+  const result = filterCareerLinksFromRules(uniqueInput, {
+    excludePatterns: settings.jobLinkExcludePatterns,
+    forceInclude: uniqueForced
+  });
+  return {
+    links: Array.from(new Set([...(result.links || []), ...uniqueForced])),
+    dropped: result.dropped || []
+  };
+}
+
+function applyAtsLinksFilter(links) {
+  const uniqueInput = Array.from(new Set((links || []).filter(Boolean)));
+  if (!settings.filterAtsLinks) {
+    return {
+      links: uniqueInput,
+      dropped: []
+    };
+  }
+  const result = filterAtsCareerLinksFromRules(uniqueInput, {
+    excludePatterns: settings.jobLinkExcludePatterns
+  });
+  return {
+    links: Array.from(new Set(result.links || [])),
+    dropped: result.dropped || []
+  };
 }
 
 function parseQueueItem(value) {
@@ -833,19 +965,52 @@ function isExternalLinkToCareer(link, careerUrl) {
   }
 }
 
+const JOB_DETAIL_LINK_REGEX =
+  /\/job\/|\/jobs\/details\/|jobdetails|jobintroduction\.action|jobid=|job_id=|gh_jid=|jid=|requisition|req=|positionid=|postingid=|\/apply\/jobs\/details\//i;
+
 function isJobDetailLikeLink(link) {
   if (!link) {
     return false;
   }
-  const lower = String(link).toLowerCase();
-  return /\/job\/|\/jobs\/details\/|jobdetails|jobintroduction\.action|jobid=|job_id=|gh_jid=|jid=|requisition|req=|positionid=|postingid=|\/apply\/jobs\/details\//.test(
-    lower
-  );
+  return JOB_DETAIL_LINK_REGEX.test(String(link));
+}
+
+function countJobDetailLinks(links) {
+  if (!Array.isArray(links) || !links.length) {
+    return 0;
+  }
+  let count = 0;
+  for (const link of links) {
+    if (isJobDetailLikeLink(link)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function buildJobDetailLinkCountExpression(fieldPath = "$jobLinks") {
+  return {
+    $size: {
+      $filter: {
+        input: fieldPath,
+        as: "link",
+        cond: {
+          $regexMatch: {
+            input: "$$link",
+            regex: JOB_DETAIL_LINK_REGEX
+          }
+        }
+      }
+    }
+  };
 }
 
 function isJobBoardLandingLink(link) {
   if (!link) {
     return false;
+  }
+  if (isAtsCareerLink(link)) {
+    return true;
   }
   const lower = String(link).toLowerCase();
   if (/careerhome\.action|searchjobs|jobsearch|search\.aspx|\/jobs\/?$|\/jobs\?|\/career\/?$|\/career\?|\/careers\/?$|\/careers\?/.test(lower)) {
@@ -854,7 +1019,22 @@ function isJobBoardLandingLink(link) {
   try {
     const parsed = new URL(link);
     const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname.toLowerCase();
     if (host.includes("myworkdayjobs.com") && !isJobDetailLikeLink(link)) {
+      return true;
+    }
+    if (
+      host.includes("oraclecloud.com") &&
+      /\/hcmui\/candidateexperience\/[^/]+\/sites\/[^/]+\/?$/.test(pathname)
+    ) {
+      return true;
+    }
+    if (
+      host.includes("oraclecloud.com") &&
+      /\/hcmui\/candidateexperience\/[^/]+\/sites\/[^/]+\/jobs\/?$/.test(
+        pathname
+      )
+    ) {
       return true;
     }
   } catch (error) {
@@ -867,7 +1047,7 @@ async function expandExternalJobBoardJobLinks(careerUrl, jobLinks, candidateLink
   if (!settings.expandExternalJobBoardLinks) {
     return [];
   }
-  if (!Array.isArray(jobLinks) || !jobLinks.length) {
+  if (!Array.isArray(jobLinks)) {
     return [];
   }
   if (jobLinks.some((link) => isJobDetailLikeLink(link))) {
@@ -897,20 +1077,49 @@ async function expandExternalJobBoardJobLinks(careerUrl, jobLinks, candidateLink
   }
 
   const expanded = new Set();
+  const fetchedSeeds = new Set();
+  const fetchSeedJobLinks = async (seedUrl) => {
+    if (!seedUrl || fetchedSeeds.has(seedUrl)) {
+      return [];
+    }
+    fetchedSeeds.add(seedUrl);
+    const result = await fetchCareerLinks(seedUrl);
+    const seedLinksRaw = Array.isArray(result.links) ? result.links : [];
+    return filterJobLinks(
+      Array.from(new Set(seedLinksRaw.map(normalizeLink))),
+      {
+        strongPatterns: settings.jobLinkStrongPatterns,
+        weakPatterns: settings.jobLinkWeakPatterns,
+        excludePatterns: settings.jobLinkExcludePatterns
+      }
+    );
+  };
+
   for (const seedUrl of seedLinks) {
     try {
-      const result = await fetchCareerLinks(seedUrl);
-      const seedLinksRaw = Array.isArray(result.links) ? result.links : [];
-      const seedJobLinks = filterJobLinks(
-        Array.from(new Set(seedLinksRaw.map(normalizeLink))),
-        {
-          strongPatterns: settings.jobLinkStrongPatterns,
-          weakPatterns: settings.jobLinkWeakPatterns,
-          excludePatterns: settings.jobLinkExcludePatterns
-        }
-      );
+      const seedJobLinks = await fetchSeedJobLinks(seedUrl);
       for (const link of seedJobLinks) {
         expanded.add(link);
+      }
+      if (!seedJobLinks.some((link) => isJobDetailLikeLink(link))) {
+        const listingLinks = seedJobLinks
+          .filter((link) => isJobBoardLandingLink(link))
+          .slice(0, maxSeeds);
+        for (const listingUrl of listingLinks) {
+          try {
+            const listingJobLinks = await fetchSeedJobLinks(listingUrl);
+            for (const listingJobLink of listingJobLinks) {
+              expanded.add(listingJobLink);
+            }
+          } catch (listingError) {
+            log("External job board listing expansion failed.", {
+              careerUrl,
+              seedUrl,
+              listingUrl,
+              error: listingError.toString()
+            });
+          }
+        }
       }
     } catch (error) {
       log("External job board expansion failed.", {
@@ -1008,17 +1217,64 @@ async function ensurePipelineIndexes(db) {
   return ensureIndexesPromise;
 }
 
+function resolveCareerLinksStatus({
+  hasJobDetailLinks,
+  hasAtsCareerLinks,
+  isExpiredOrNoJobs,
+  excludedDomainPattern
+}) {
+  if (excludedDomainPattern) {
+    return "excluded_domain";
+  }
+  if (hasJobDetailLinks) {
+    return "job_links_found";
+  }
+  if (isExpiredOrNoJobs) {
+    return "expired_or_no_jobs";
+  }
+  if (hasAtsCareerLinks) {
+    return "ats_career_links_found";
+  }
+  return "no_job_links";
+}
+
 function buildCareerLinksSuccessUpdate(
   careerUrl,
   links,
   jobLinks,
+  atsCareerLinks,
   source,
   userAgent,
-  startedAt
+  startedAt,
+  analysis = {}
 ) {
   const now = new Date();
+  const atsLinks = Array.isArray(atsCareerLinks) ? atsCareerLinks : [];
   const hasJobLinks = jobLinks.length > 0;
+  const jobDetailLinkCount = countJobDetailLinks(jobLinks);
+  const hasJobDetailLinks = jobDetailLinkCount > 0;
+  const hasAtsCareerLinks = atsLinks.length > 0;
+  const isExpiredOrNoJobs = Boolean(analysis.isExpiredOrNoJobs);
+  const excludedDomainPattern = String(analysis.excludedDomainPattern || "");
+  const expireKeywordMatches = Array.isArray(analysis.expireKeywordMatches)
+    ? analysis.expireKeywordMatches.slice(0, 20)
+    : [];
+  const expireKeywordMatchCount = Number(
+    analysis.expireKeywordMatchCount || expireKeywordMatches.length || 0
+  );
+  const statusCode = Number(analysis.statusCode || 0);
+  const finalUrl = String(analysis.finalUrl || "");
+  const pageTitle = String(analysis.pageTitle || "").slice(0, 300);
+  const textFilteredLinkCount = Number(analysis.textFilteredLinkCount || 0);
+  const careerFilteredLinkCount = Number(analysis.careerFilteredLinkCount || 0);
+  const atsFilteredLinkCount = Number(analysis.atsFilteredLinkCount || 0);
   const jobLinksStatus = hasJobLinks ? "job_links_found" : "no_job_links";
+  const careerLinksStatus = resolveCareerLinksStatus({
+    hasJobDetailLinks,
+    hasAtsCareerLinks,
+    isExpiredOrNoJobs,
+    excludedDomainPattern
+  });
   if (!settings.mergeLinksAcrossRuns) {
     return {
       $set: {
@@ -1028,7 +1284,23 @@ function buildCareerLinksSuccessUpdate(
         jobLinks,
         jobLinkCount: jobLinks.length,
         hasJobLinks,
+        jobDetailLinkCount,
+        hasJobDetailLinks,
         jobLinksStatus,
+        atsCareerLinks: atsLinks,
+        atsCareerLinkCount: atsLinks.length,
+        hasAtsCareerLinks,
+        careerLinksStatus,
+        expiredOrNoJobs: isExpiredOrNoJobs,
+        expireKeywordMatches,
+        expireKeywordMatchCount,
+        excludedDomainPattern,
+        textFilteredLinkCount,
+        careerFilteredLinkCount,
+        atsFilteredLinkCount,
+        httpStatusCode: statusCode,
+        finalUrl: finalUrl || careerUrl,
+        pageTitle,
         crawlStatus: "success",
         source,
         userAgent,
@@ -1054,6 +1326,19 @@ function buildCareerLinksSuccessUpdate(
         jobLinks: {
           $setUnion: [{ $ifNull: ["$jobLinks", []] }, jobLinks]
         },
+        atsCareerLinks: {
+          $setUnion: [{ $ifNull: ["$atsCareerLinks", []] }, atsLinks]
+        },
+        expiredOrNoJobs: isExpiredOrNoJobs,
+        expireKeywordMatches,
+        expireKeywordMatchCount,
+        excludedDomainPattern,
+        textFilteredLinkCount,
+        careerFilteredLinkCount,
+        atsFilteredLinkCount,
+        httpStatusCode: statusCode,
+        finalUrl: finalUrl || careerUrl,
+        pageTitle,
         source,
         userAgent,
         fetchedAt: now,
@@ -1067,19 +1352,101 @@ function buildCareerLinksSuccessUpdate(
     },
     {
       $set: {
+        jobDetailLinkCount: buildJobDetailLinkCountExpression("$jobLinks"),
         linkCount: { $size: "$links" },
         jobLinkCount: { $size: "$jobLinks" },
+        atsCareerLinkCount: { $size: { $ifNull: ["$atsCareerLinks", []] } },
         hasJobLinks: { $gt: [{ $size: "$jobLinks" }, 0] },
+        hasJobDetailLinks: {
+          $gt: [buildJobDetailLinkCountExpression("$jobLinks"), 0]
+        },
+        hasAtsCareerLinks: {
+          $gt: [{ $size: { $ifNull: ["$atsCareerLinks", []] } }, 0]
+        },
         jobLinksStatus: {
           $cond: [
             { $gt: [{ $size: "$jobLinks" }, 0] },
             "job_links_found",
             "no_job_links"
           ]
+        },
+        careerLinksStatus: {
+          $cond: [
+            {
+              $gt: [
+                { $strLenCP: { $ifNull: ["$excludedDomainPattern", ""] } },
+                0
+              ]
+            },
+            "excluded_domain",
+            {
+              $cond: [
+                { $gt: [buildJobDetailLinkCountExpression("$jobLinks"), 0] },
+                "job_links_found",
+                {
+                  $cond: [
+                    { $eq: ["$expiredOrNoJobs", true] },
+                    "expired_or_no_jobs",
+                    {
+                      $cond: [
+                        {
+                          $gt: [
+                            { $size: { $ifNull: ["$atsCareerLinks", []] } },
+                            0
+                          ]
+                        },
+                        "ats_career_links_found",
+                        "no_job_links"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
         }
       }
     }
   ];
+}
+
+function buildCareerLinksExcludedUpdate(careerUrl, excludedDomainPattern, startedAt) {
+  const now = new Date();
+  return {
+    $set: {
+      careerUrl,
+      links: [],
+      linkCount: 0,
+      jobLinks: [],
+      jobLinkCount: 0,
+      jobDetailLinkCount: 0,
+      hasJobLinks: false,
+      hasJobDetailLinks: false,
+      atsCareerLinks: [],
+      atsCareerLinkCount: 0,
+      hasAtsCareerLinks: false,
+      expiredOrNoJobs: false,
+      expireKeywordMatches: [],
+      expireKeywordMatchCount: 0,
+      excludedDomainPattern: String(excludedDomainPattern || ""),
+      textFilteredLinkCount: 0,
+      careerFilteredLinkCount: 0,
+      atsFilteredLinkCount: 0,
+      crawlStatus: "success",
+      jobLinksStatus: "no_job_links",
+      careerLinksStatus: "excluded_domain",
+      source: "rules",
+      userAgent: null,
+      fetchedAt: now,
+      startedAt,
+      lastSuccessAt: now,
+      updatedAt: now,
+      error: null
+    },
+    $setOnInsert: {
+      createdAt: now
+    }
+  };
 }
 
 function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
@@ -1090,6 +1457,11 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
         careerUrl,
         crawlStatus: "error",
         jobLinksStatus: "error",
+        careerLinksStatus: "error",
+        expiredOrNoJobs: false,
+        expireKeywordMatches: [],
+        expireKeywordMatchCount: 0,
+        excludedDomainPattern: "",
         error: error.toString(),
         lastErrorAt: now,
         fetchedAt: now,
@@ -1101,6 +1473,14 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
         linkCount: 0,
         jobLinks: [],
         jobLinkCount: 0,
+        jobDetailLinkCount: 0,
+        hasJobDetailLinks: false,
+        atsCareerLinks: [],
+        atsCareerLinkCount: 0,
+        hasAtsCareerLinks: false,
+        textFilteredLinkCount: 0,
+        careerFilteredLinkCount: 0,
+        atsFilteredLinkCount: 0,
         createdAt: now
       }
     };
@@ -1112,9 +1492,22 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt) {
       linkCount: 0,
       jobLinks: [],
       jobLinkCount: 0,
+      jobDetailLinkCount: 0,
+      atsCareerLinks: [],
+      atsCareerLinkCount: 0,
       hasJobLinks: false,
+      hasJobDetailLinks: false,
+      hasAtsCareerLinks: false,
+      expiredOrNoJobs: false,
+      expireKeywordMatches: [],
+      expireKeywordMatchCount: 0,
+      excludedDomainPattern: "",
+      textFilteredLinkCount: 0,
+      careerFilteredLinkCount: 0,
+      atsFilteredLinkCount: 0,
       crawlStatus: "error",
       jobLinksStatus: "error",
+      careerLinksStatus: "error",
       error: error.toString(),
       lastErrorAt: now,
       fetchedAt: now,
@@ -1302,24 +1695,44 @@ async function markMongoHtmlJobState(
 }
 
 async function fetchCareerLinks(url) {
-  if (settings.linksFetchMode === "puppeteer") {
-    return fetchLinksWithPuppeteer(url, {
-      timeoutMs: settings.puppeteerTimeoutMs
+  const buildGotLinksResult = (gotResult) => {
+    const linkEntries = extractLinkEntriesFromHtml(gotResult.html, url, {
+      sameDomainOnly: false
     });
+    const links = Array.from(
+      new Set(linkEntries.map((entry) => entry.url).filter(Boolean))
+    );
+    const pageSignals = extractPageTextSampleFromHtml(gotResult.html, {
+      maxLength: settings.expireDetectionTextLimit
+    });
+    return {
+      links,
+      linkEntries,
+      source: "got",
+      userAgent: gotResult.userAgent,
+      statusCode: gotResult.statusCode || 0,
+      finalUrl: gotResult.finalUrl || url,
+      pageTitle: pageSignals.title || "",
+      pageTextSample: pageSignals.textSample || ""
+    };
+  };
+
+  if (settings.linksFetchMode === "puppeteer") {
+    const puppeteerResult = await fetchLinksWithPuppeteer(url, {
+      timeoutMs: settings.puppeteerTimeoutMs,
+      pageTextLimit: settings.expireDetectionTextLimit
+    });
+    return {
+      ...puppeteerResult,
+      finalUrl: puppeteerResult.finalUrl || url
+    };
   }
 
   if (settings.linksFetchMode === "got") {
     const gotResult = await fetchHtmlWithGot(url, {
       timeoutMs: settings.gotTimeoutMs
     });
-    const links = extractLinksFromHtml(gotResult.html, url, {
-      sameDomainOnly: false
-    });
-    return {
-      links,
-      source: "got",
-      userAgent: gotResult.userAgent
-    };
+    return buildGotLinksResult(gotResult);
   }
 
   let gotResult = null;
@@ -1327,9 +1740,8 @@ async function fetchCareerLinks(url) {
     gotResult = await fetchHtmlWithGot(url, {
       timeoutMs: settings.gotTimeoutMs
     });
-    const links = extractLinksFromHtml(gotResult.html, url, {
-      sameDomainOnly: false
-    });
+    const gotLinksResult = buildGotLinksResult(gotResult);
+    const links = gotLinksResult.links;
     const likelyJobLinks = filterJobLinks(links, {
       strongPatterns: settings.jobLinkStrongPatterns,
       weakPatterns: settings.jobLinkWeakPatterns,
@@ -1339,11 +1751,7 @@ async function fetchCareerLinks(url) {
       settings.minLikelyJobLinksForGot <= 0 ||
       likelyJobLinks.length >= settings.minLikelyJobLinksForGot;
     if (links.length >= settings.minLinksForGot && hasEnoughLikelyJobs) {
-      return {
-        links,
-        source: "got",
-        userAgent: gotResult.userAgent
-      };
+      return gotLinksResult;
     }
     log("Got did not meet link quality threshold, falling back to puppeteer.", {
       url,
@@ -1360,7 +1768,8 @@ async function fetchCareerLinks(url) {
   }
 
   const puppeteerResult = await fetchLinksWithPuppeteer(url, {
-    timeoutMs: settings.puppeteerTimeoutMs
+    timeoutMs: settings.puppeteerTimeoutMs,
+    pageTextLimit: settings.expireDetectionTextLimit
   });
   const initialLinks = Array.isArray(puppeteerResult.links)
     ? puppeteerResult.links
@@ -1375,7 +1784,8 @@ async function fetchCareerLinks(url) {
   }
   try {
     const retryResult = await fetchLinksWithPuppeteer(url, {
-      timeoutMs: settings.puppeteerTimeoutMs
+      timeoutMs: settings.puppeteerTimeoutMs,
+      pageTextLimit: settings.expireDetectionTextLimit
     });
     const retryLinks = Array.isArray(retryResult.links) ? retryResult.links : [];
     const retryLikelyJobLinks = filterJobLinks(retryLinks, {
@@ -1403,7 +1813,10 @@ async function fetchCareerLinks(url) {
       error: error.toString()
     });
   }
-  return puppeteerResult;
+  return {
+    ...puppeteerResult,
+    finalUrl: puppeteerResult.finalUrl || url
+  };
 }
 
 async function fetchPageHtml(url) {
@@ -1633,14 +2046,73 @@ async function runLinksWorker(args) {
           let shouldAck = false;
           const startedAt = new Date();
           try {
-            const { links, source, userAgent } = await fetchCareerLinks(url);
+            const excludedSourceDomain = isExcludedDomain(url);
+            if (excludedSourceDomain.excluded) {
+              await collection.updateOne(
+                { careerUrl: url },
+                buildCareerLinksExcludedUpdate(
+                  url,
+                  excludedSourceDomain.pattern,
+                  startedAt
+                ),
+                { upsert: true }
+              );
+              processed += 1;
+              log("Career url excluded by domain rules.", {
+                url,
+                excludedDomainPattern: excludedSourceDomain.pattern,
+                retryCount: decodedMessage.retryCount
+              });
+              shouldAck = true;
+              return;
+            }
+
+            const {
+              links,
+              linkEntries,
+              source,
+              userAgent,
+              statusCode,
+              finalUrl,
+              pageTitle,
+              pageTextSample
+            } = await fetchCareerLinks(url);
+            const normalizedLinkEntries = Array.from(
+              new Set(
+                (Array.isArray(linkEntries) ? linkEntries : [])
+                  .map((entry) => ({
+                    url: normalizeLink(entry && entry.url),
+                    text: String((entry && entry.text) || "").trim()
+                  }))
+                  .filter((entry) => Boolean(entry.url))
+                  .map((entry) => `${entry.url}\n${entry.text}`)
+              )
+            ).map((value) => {
+              const [entryUrl, ...rest] = value.split("\n");
+              return {
+                url: entryUrl,
+                text: rest.join("\n")
+              };
+            });
             const rawNormalizedLinks = Array.from(
-              new Set((links || []).map(normalizeLink))
+              new Set(
+                [
+                  ...(Array.isArray(links) ? links : []),
+                  ...normalizedLinkEntries.map((entry) => entry.url)
+                ]
+                  .map(normalizeLink)
+                  .filter(Boolean)
+              )
             );
             let normalizedLinks = rawNormalizedLinks;
             normalizedLinks = filterSameDomain(normalizedLinks, url);
             normalizedLinks = applySocialMediaFilter(normalizedLinks, url);
             normalizedLinks = Array.from(new Set(normalizedLinks));
+            const textFilterResult = applyAnchorTextFilter(
+              normalizedLinks,
+              normalizedLinkEntries
+            );
+            normalizedLinks = textFilterResult.links;
             let jobLinks = filterJobLinks(normalizedLinks, {
               strongPatterns: settings.jobLinkStrongPatterns,
               weakPatterns: settings.jobLinkWeakPatterns,
@@ -1657,11 +2129,59 @@ async function runLinksWorker(args) {
                 new Set([...normalizedLinks, ...expandedJobLinks])
               );
             }
+            let jobDetailLinkCount = countJobDetailLinks(jobLinks);
+            let detailJobLinks = jobLinks.filter((link) =>
+              isJobDetailLikeLink(link)
+            );
+            const rawAtsCareerLinks = extractAtsCareerLinks(
+              Array.from(new Set([...rawNormalizedLinks, ...normalizedLinks]))
+            );
+            const atsFilterResult = applyAtsLinksFilter(rawAtsCareerLinks);
+            let atsCareerLinks = atsFilterResult.links;
+            const careerFilterResult = applyCareerLinksFilter(normalizedLinks, [
+              url,
+              finalUrl || "",
+              ...jobLinks,
+              ...atsCareerLinks
+            ]);
+            normalizedLinks = careerFilterResult.links;
             if (isLikelyBotChallengeResult(rawNormalizedLinks, jobLinks)) {
               throw new Error(
                 "Bot challenge detected while fetching career page; retrying."
               );
             }
+            const finalUrlExcluded = isExcludedDomain(finalUrl || "");
+            if (finalUrlExcluded.excluded) {
+              normalizedLinks = [];
+              jobLinks = [];
+              jobDetailLinkCount = 0;
+              detailJobLinks = [];
+              atsCareerLinks = [];
+            }
+            let expireSignals = {
+              isExpiredOrNoJobs: false,
+              matchedKeywords: [],
+              matchedKeywordCount: 0
+            };
+            if (
+              settings.enableExpireKeywordDetection &&
+              !jobDetailLinkCount &&
+              !finalUrlExcluded.excluded
+            ) {
+              expireSignals = detectExpiredOrNoJobs(pageTextSample || "", {
+                title: pageTitle || "",
+                statusCode: statusCode || 0,
+                limit: settings.expireKeywordMatchLimit
+              });
+            }
+            const careerLinksStatus = resolveCareerLinksStatus({
+              hasJobDetailLinks: jobDetailLinkCount > 0,
+              hasAtsCareerLinks: atsCareerLinks.length > 0,
+              isExpiredOrNoJobs: expireSignals.isExpiredOrNoJobs,
+              excludedDomainPattern: finalUrlExcluded.excluded
+                ? finalUrlExcluded.pattern
+                : ""
+            });
 
             await collection.updateOne(
               { careerUrl: url },
@@ -1669,9 +2189,24 @@ async function runLinksWorker(args) {
                 url,
                 normalizedLinks,
                 jobLinks,
+                atsCareerLinks,
                 source,
                 userAgent,
-                startedAt
+                startedAt,
+                {
+                  isExpiredOrNoJobs: expireSignals.isExpiredOrNoJobs,
+                  expireKeywordMatches: expireSignals.matchedKeywords,
+                  expireKeywordMatchCount: expireSignals.matchedKeywordCount,
+                  excludedDomainPattern: finalUrlExcluded.excluded
+                    ? finalUrlExcluded.pattern
+                    : "",
+                  statusCode: statusCode || 0,
+                  finalUrl: finalUrl || url,
+                  pageTitle: pageTitle || "",
+                  textFilteredLinkCount: textFilterResult.dropped.length,
+                  careerFilteredLinkCount: careerFilterResult.dropped.length,
+                  atsFilteredLinkCount: atsFilterResult.dropped.length
+                }
               ),
               { upsert: true }
             );
@@ -1680,13 +2215,17 @@ async function runLinksWorker(args) {
             const persistedCount = await persistDiscoveredJobLinks(
               jobLinksCollection,
               url,
-              jobLinks,
+              detailJobLinks,
               discoveredAt
             );
-            const queuedCount = await enqueueJobLinks(redisClient, url, jobLinks);
-            if (settings.enqueueHtmlFromLinksWorker && jobLinks.length) {
+            const queuedCount = await enqueueJobLinks(
+              redisClient,
+              url,
+              detailJobLinks
+            );
+            if (settings.enqueueHtmlFromLinksWorker && detailJobLinks.length) {
               await jobLinksCollection.updateMany(
-                { url: { $in: jobLinks } },
+                { url: { $in: detailJobLinks } },
                 {
                   $set: {
                     htmlQueued: true,
@@ -1702,6 +2241,14 @@ async function runLinksWorker(args) {
               url,
               linkCount: normalizedLinks.length,
               jobLinkCount: jobLinks.length,
+              jobDetailLinkCount,
+              atsCareerLinkCount: atsCareerLinks.length,
+              careerLinksStatus,
+              expiredOrNoJobs: expireSignals.isExpiredOrNoJobs,
+              expireKeywordMatchCount: expireSignals.matchedKeywordCount,
+              textFilteredLinkCount: textFilterResult.dropped.length,
+              careerFilteredLinkCount: careerFilterResult.dropped.length,
+              atsFilteredLinkCount: atsFilterResult.dropped.length,
               expandedJobLinkCount: expandedJobLinks.length,
               source,
               persistedJobLinks: persistedCount,
