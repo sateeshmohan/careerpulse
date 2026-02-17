@@ -171,6 +171,7 @@
         },
         "same_domain_only": true,
         "min_links_for_got": 5,
+        "links_fetch_mode": "auto",
         "min_html_length": 1000,
         "got_timeout_ms": 20000,
         "puppeteer_timeout_ms": 60000,

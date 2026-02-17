@@ -149,6 +149,7 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `ENQUEUE_HTML_FROM_LINKS_WORKER`: `false` recommended for delayed HTML batch.
 - `PRESERVE_LINKS_ON_ERROR`: keep existing links when a crawl fails.
 - `MERGE_LINKS_ACROSS_RUNS`: union old + new discovered links.
+- `LINKS_FETCH_MODE`: `auto` (default), `puppeteer`, or `got` for `worker:links`.
 - `REDIS_ENQUEUE_BATCH_SIZE`: Redis enqueue batch size.
 - `MONGO_BULK_WRITE_BATCH_SIZE`: Mongo bulk upsert batch size.
 - `HTML_MONGO_LOCK_MS`: lock duration for Mongo HTML claim.

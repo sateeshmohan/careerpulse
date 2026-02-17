@@ -82,6 +82,14 @@ const parseBoolean = (value, fallback) => {
   return ["1", "true", "yes", "y"].includes(String(value).toLowerCase());
 };
 
+function parseFetchMode(value, fallback = "auto") {
+  const normalized = String(value || fallback).toLowerCase();
+  if (normalized === "puppeteer" || normalized === "got" || normalized === "auto") {
+    return normalized;
+  }
+  return fallback;
+}
+
 const settings = {
   sameDomainOnly: parseBoolean(
     process.env.SAME_DOMAIN_ONLY,
@@ -93,6 +101,12 @@ const settings = {
     process.env.MIN_GOT_LINKS ||
     pipelineConfig.min_links_for_got ||
     5
+  ),
+  linksFetchMode: parseFetchMode(
+    process.env.LINKS_FETCH_MODE ||
+      pipelineConfig.links_fetch_mode ||
+      "auto",
+    "auto"
   ),
   minHtmlLength: Number(
     process.env.MIN_HTML_LENGTH ||
@@ -1080,6 +1094,26 @@ async function markMongoHtmlJobState(
 }
 
 async function fetchCareerLinks(url) {
+  if (settings.linksFetchMode === "puppeteer") {
+    return fetchLinksWithPuppeteer(url, {
+      timeoutMs: settings.puppeteerTimeoutMs
+    });
+  }
+
+  if (settings.linksFetchMode === "got") {
+    const gotResult = await fetchHtmlWithGot(url, {
+      timeoutMs: settings.gotTimeoutMs
+    });
+    const links = extractLinksFromHtml(gotResult.html, url, {
+      sameDomainOnly: settings.sameDomainOnly
+    });
+    return {
+      links,
+      source: "got",
+      userAgent: gotResult.userAgent
+    };
+  }
+
   let gotResult = null;
   try {
     gotResult = await fetchHtmlWithGot(url, {
