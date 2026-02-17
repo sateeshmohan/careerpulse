@@ -84,6 +84,15 @@ function isLikelyJobLink(link, options = {}) {
     return false;
   }
   const lower = String(link).toLowerCase();
+  if (lower.startsWith("javascript:")) {
+    return false;
+  }
+  if (lower.includes("emailme.asp")) {
+    return false;
+  }
+  if (/jobcode=0(?:[^0-9]|$)/.test(lower)) {
+    return false;
+  }
   const strongPatterns =
     normalizePatterns(options.strongPatterns) ||
     normalizePatterns(DEFAULT_STRONG_PATTERNS);

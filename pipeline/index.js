@@ -118,6 +118,17 @@ const settings = {
     pipelineConfig.min_likely_job_links_for_got ||
     1
   ),
+  expandExternalJobBoardLinks: parseBoolean(
+    process.env.EXPAND_EXTERNAL_JOB_BOARD_LINKS,
+    pipelineConfig.expand_external_job_board_links !== undefined
+      ? pipelineConfig.expand_external_job_board_links
+      : true
+  ),
+  jobBoardExpansionMaxSeeds: Number(
+    process.env.JOB_BOARD_EXPANSION_MAX_SEEDS ||
+    pipelineConfig.job_board_expansion_max_seeds ||
+    1
+  ),
   linksFetchMode: parseFetchMode(
     process.env.LINKS_FETCH_MODE ||
       pipelineConfig.links_fetch_mode ||
@@ -772,6 +783,111 @@ function isLikelyJobLink(url) {
   );
 }
 
+function isExternalLinkToCareer(link, careerUrl) {
+  try {
+    const linkHost = new URL(link).hostname.replace(/^www\./i, "").toLowerCase();
+    const careerHost = new URL(careerUrl)
+      .hostname
+      .replace(/^www\./i, "")
+      .toLowerCase();
+    return Boolean(linkHost && careerHost && linkHost !== careerHost);
+  } catch (error) {
+    return false;
+  }
+}
+
+function isJobDetailLikeLink(link) {
+  if (!link) {
+    return false;
+  }
+  const lower = String(link).toLowerCase();
+  return /\/job\/|\/jobs\/details\/|jobdetails|jobintroduction\.action|jobid=|job_id=|gh_jid=|jid=|requisition|req=|positionid=|postingid=|\/apply\/jobs\/details\//.test(
+    lower
+  );
+}
+
+function isJobBoardLandingLink(link) {
+  if (!link) {
+    return false;
+  }
+  const lower = String(link).toLowerCase();
+  if (/careerhome\.action|searchjobs|jobsearch|search\.aspx|\/jobs\/?$|\/jobs\?|\/career\/?$|\/career\?|\/careers\/?$|\/careers\?/.test(lower)) {
+    return true;
+  }
+  try {
+    const parsed = new URL(link);
+    const host = parsed.hostname.toLowerCase();
+    if (host.includes("myworkdayjobs.com") && !isJobDetailLikeLink(link)) {
+      return true;
+    }
+  } catch (error) {
+    return false;
+  }
+  return false;
+}
+
+async function expandExternalJobBoardJobLinks(careerUrl, jobLinks, candidateLinks = []) {
+  if (!settings.expandExternalJobBoardLinks) {
+    return [];
+  }
+  if (!Array.isArray(jobLinks) || !jobLinks.length) {
+    return [];
+  }
+  if (jobLinks.some((link) => isJobDetailLikeLink(link))) {
+    return [];
+  }
+
+  const maxSeeds = Number.isFinite(Number(settings.jobBoardExpansionMaxSeeds))
+    ? Math.max(0, Math.floor(Number(settings.jobBoardExpansionMaxSeeds)))
+    : 1;
+  if (maxSeeds <= 0) {
+    return [];
+  }
+
+  const seedCandidates = Array.from(
+    new Set([...(Array.isArray(jobLinks) ? jobLinks : []), ...(Array.isArray(candidateLinks) ? candidateLinks : [])])
+  );
+  const seedLinks = Array.from(
+    new Set(
+      seedCandidates.filter(
+        (link) =>
+          isExternalLinkToCareer(link, careerUrl) && isJobBoardLandingLink(link)
+      )
+    )
+  ).slice(0, maxSeeds);
+  if (!seedLinks.length) {
+    return [];
+  }
+
+  const expanded = new Set();
+  for (const seedUrl of seedLinks) {
+    try {
+      const result = await fetchCareerLinks(seedUrl);
+      const seedLinksRaw = Array.isArray(result.links) ? result.links : [];
+      const seedJobLinks = filterJobLinks(
+        Array.from(new Set(seedLinksRaw.map(normalizeLink))),
+        {
+          strongPatterns: settings.jobLinkStrongPatterns,
+          weakPatterns: settings.jobLinkWeakPatterns,
+          excludePatterns: settings.jobLinkExcludePatterns
+        }
+      );
+      for (const link of seedJobLinks) {
+        expanded.add(link);
+      }
+    } catch (error) {
+      log("External job board expansion failed.", {
+        careerUrl,
+        seedUrl,
+        error: error.toString()
+      });
+    }
+  }
+
+  const current = new Set(jobLinks);
+  return Array.from(expanded).filter((link) => !current.has(link));
+}
+
 async function findAnyDocument(collection, query) {
   const doc = await collection.findOne(query, { projection: { _id: 1 } });
   return Boolean(doc);
@@ -1209,6 +1325,47 @@ async function fetchCareerLinks(url) {
   const puppeteerResult = await fetchLinksWithPuppeteer(url, {
     timeoutMs: settings.puppeteerTimeoutMs
   });
+  const initialLinks = Array.isArray(puppeteerResult.links)
+    ? puppeteerResult.links
+    : [];
+  const initialLikelyJobLinks = filterJobLinks(initialLinks, {
+    strongPatterns: settings.jobLinkStrongPatterns,
+    weakPatterns: settings.jobLinkWeakPatterns,
+    excludePatterns: settings.jobLinkExcludePatterns
+  }).length;
+  if (initialLinks.length > 1 && initialLikelyJobLinks > 0) {
+    return puppeteerResult;
+  }
+  try {
+    const retryResult = await fetchLinksWithPuppeteer(url, {
+      timeoutMs: settings.puppeteerTimeoutMs
+    });
+    const retryLinks = Array.isArray(retryResult.links) ? retryResult.links : [];
+    const retryLikelyJobLinks = filterJobLinks(retryLinks, {
+      strongPatterns: settings.jobLinkStrongPatterns,
+      weakPatterns: settings.jobLinkWeakPatterns,
+      excludePatterns: settings.jobLinkExcludePatterns
+    }).length;
+    const retryIsBetter =
+      retryLikelyJobLinks > initialLikelyJobLinks ||
+      (retryLikelyJobLinks === initialLikelyJobLinks &&
+        retryLinks.length > initialLinks.length);
+    if (retryIsBetter) {
+      log("Puppeteer retry returned more links.", {
+        url,
+        initialCount: initialLinks.length,
+        retryCount: retryLinks.length,
+        initialLikelyJobLinks,
+        retryLikelyJobLinks
+      });
+      return retryResult;
+    }
+  } catch (error) {
+    log("Puppeteer retry failed.", {
+      url,
+      error: error.toString()
+    });
+  }
   return puppeteerResult;
 }
 
@@ -1440,15 +1597,29 @@ async function runLinksWorker(args) {
           const startedAt = new Date();
           try {
             const { links, source, userAgent } = await fetchCareerLinks(url);
-            let normalizedLinks = links.map(normalizeLink);
+            const rawNormalizedLinks = Array.from(
+              new Set((links || []).map(normalizeLink))
+            );
+            let normalizedLinks = rawNormalizedLinks;
             normalizedLinks = filterSameDomain(normalizedLinks, url);
             normalizedLinks = applySocialMediaFilter(normalizedLinks, url);
             normalizedLinks = Array.from(new Set(normalizedLinks));
-            const jobLinks = filterJobLinks(normalizedLinks, {
+            let jobLinks = filterJobLinks(normalizedLinks, {
               strongPatterns: settings.jobLinkStrongPatterns,
               weakPatterns: settings.jobLinkWeakPatterns,
               excludePatterns: settings.jobLinkExcludePatterns
             });
+            const expandedJobLinks = await expandExternalJobBoardJobLinks(
+              url,
+              jobLinks,
+              rawNormalizedLinks
+            );
+            if (expandedJobLinks.length) {
+              jobLinks = Array.from(new Set([...jobLinks, ...expandedJobLinks]));
+              normalizedLinks = Array.from(
+                new Set([...normalizedLinks, ...expandedJobLinks])
+              );
+            }
 
             await collection.updateOne(
               { careerUrl: url },
@@ -1489,6 +1660,7 @@ async function runLinksWorker(args) {
               url,
               linkCount: normalizedLinks.length,
               jobLinkCount: jobLinks.length,
+              expandedJobLinkCount: expandedJobLinks.length,
               source,
               persistedJobLinks: persistedCount,
               queuedJobLinks: queuedCount,

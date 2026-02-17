@@ -49,10 +49,14 @@ function extractInlineLinksFromHandler(handlerText) {
     return [];
   }
   const links = [];
-  const regex = /(['"])(https?:\/\/[^'"]+|\/\/[^'"]+|\/[^'"]+|\.\.?\/[^'"]+)\1/g;
+  const quotedRegex = /(['"])(https?:\/\/[^'"]+|\/\/[^'"]+|\/[^'"]+|\.\.?\/[^'"]+)\1/g;
   let match = null;
-  while ((match = regex.exec(handlerText)) !== null) {
+  while ((match = quotedRegex.exec(handlerText)) !== null) {
     links.push(match[2]);
+  }
+  const absoluteRegex = /https?:\/\/[^\s"'`<>)]+/g;
+  while ((match = absoluteRegex.exec(handlerText)) !== null) {
+    links.push(match[0]);
   }
   return links;
 }

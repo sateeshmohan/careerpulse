@@ -159,6 +159,10 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `KEEP_EXTERNAL_LIKELY_JOB_LINKS`: keep external links when they match job-link patterns (useful for iframe ATS boards).
 - `LINKS_FETCH_MODE`: `auto` (default), `puppeteer`, or `got` for `worker:links`.
 - `MIN_LIKELY_JOB_LINKS_FOR_GOT`: in `auto` mode, minimum likely job links required to accept Got result before Puppeteer fallback.
+- `EXPAND_EXTERNAL_JOB_BOARD_LINKS`: when enabled, expand external career-home links (for example Paycor/Workday boards) to collect job-detail links.
+- `JOB_BOARD_EXPANSION_MAX_SEEDS`: maximum external job-board seed links expanded per career page crawl.
+- `JOB_LINK_STRONG_PATTERNS`: include provider-specific markers (for example AppOne `jobcode=`) when needed.
+- `JOB_LINK_EXCLUDE_PATTERNS`: use this to suppress non-job actions (for example `emailme.asp`, `jobcode=0`).
 - `REDIS_ENQUEUE_BATCH_SIZE`: Redis enqueue batch size.
 - `MONGO_BULK_WRITE_BATCH_SIZE`: Mongo bulk upsert batch size.
 - `HTML_MONGO_LOCK_MS`: lock duration for Mongo HTML claim.
