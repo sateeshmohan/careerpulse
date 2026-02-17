@@ -1363,21 +1363,30 @@ async function findAnyDocument(collection, query) {
   return Boolean(doc);
 }
 
-async function selectSeedCollection(db, candidates, fieldName, markField) {
+async function selectSeedCollection(
+  db,
+  candidates,
+  fieldName,
+  markField,
+  options = {}
+) {
   const uniqueCandidates = Array.from(
     new Set((candidates || []).filter(Boolean))
   );
   if (!uniqueCandidates.length) {
     return { name: null, reason: "no_candidates" };
   }
+  const includeSeeded = Boolean(options.includeSeeded);
   const markFieldName = markField || "redisSeeded";
   const baseQuery = { [fieldName]: { $exists: true, $ne: null } };
   const unseededQuery = { ...baseQuery, [markFieldName]: { $ne: true } };
 
-  for (const name of uniqueCandidates) {
-    const collection = db.collection(name);
-    if (await findAnyDocument(collection, unseededQuery)) {
-      return { name, reason: "has_unseeded_docs" };
+  if (!includeSeeded) {
+    for (const name of uniqueCandidates) {
+      const collection = db.collection(name);
+      if (await findAnyDocument(collection, unseededQuery)) {
+        return { name, reason: "has_unseeded_docs" };
+      }
     }
   }
 
@@ -1389,6 +1398,85 @@ async function selectSeedCollection(db, candidates, fieldName, markField) {
   }
 
   return { name: uniqueCandidates[0], reason: "fallback" };
+}
+
+function buildUrlAliasCandidates(urlCandidates = []) {
+  const aliasesSet = new Set(
+    (urlCandidates || [])
+      .map((candidate) => normalizeLink(candidate))
+      .filter(Boolean)
+  );
+  for (const alias of Array.from(aliasesSet)) {
+    try {
+      const parsed = new URL(alias);
+      if (!/^https?:$/i.test(parsed.protocol)) {
+        continue;
+      }
+      const httpVariant = new URL(parsed.toString());
+      httpVariant.protocol = "http:";
+      aliasesSet.add(normalizeLink(httpVariant.toString()));
+
+      const httpsVariant = new URL(parsed.toString());
+      httpsVariant.protocol = "https:";
+      aliasesSet.add(normalizeLink(httpsVariant.toString()));
+    } catch (error) {
+      // ignore invalid URL variants
+    }
+  }
+  const aliases = Array.from(aliasesSet).filter(Boolean);
+  const keys = Array.from(
+    new Set(aliases.map((url) => buildLinkDedupeKey(url)).filter(Boolean))
+  );
+  return { aliases, keys };
+}
+
+async function findCompletedCareerLinkKeySet(careerLinksCollection, urls = []) {
+  const { aliases, keys } = buildUrlAliasCandidates(urls);
+  const clauses = [];
+  if (keys.length) {
+    clauses.push({ careerUrlKey: { $in: keys } });
+  }
+  if (aliases.length) {
+    clauses.push({ careerUrl: { $in: aliases } });
+  }
+  if (!clauses.length) {
+    return new Set();
+  }
+  const filter =
+    clauses.length === 1 ? clauses[0] : { $or: clauses };
+  const cursor = careerLinksCollection.find(
+    {
+      $and: [filter, { crawlStatus: "success" }]
+    },
+    {
+      projection: {
+        careerUrlKey: 1,
+        careerUrl: 1
+      }
+    }
+  );
+  const completed = new Set();
+  for await (const doc of cursor) {
+    if (doc && doc.careerUrlKey) {
+      completed.add(String(doc.careerUrlKey));
+    }
+    if (doc && doc.careerUrl) {
+      const key = buildLinkDedupeKey(doc.careerUrl);
+      if (key) {
+        completed.add(key);
+      }
+    }
+  }
+  return completed;
+}
+
+async function getStreamLengthSafe(redisClient, streamKey) {
+  try {
+    const length = await redisClient.xLen(streamKey);
+    return Number(length) || 0;
+  } catch (error) {
+    return 0;
+  }
 }
 
 let ensureIndexesPromise = null;
@@ -2209,7 +2297,9 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
     batchSize = 500,
     max = 0,
     markField = "redisSeeded",
-    markAtField = "redisSeededAt"
+    markAtField = "redisSeededAt",
+    includeSeeded = false,
+    skipCompletedByCareerLinks = false
   } = options;
   const resolvedBatchSize = Number.isFinite(Number(batchSize)) ? Number(batchSize) : 500;
   const safeBatchSize = resolvedBatchSize > 0 ? resolvedBatchSize : 500;
@@ -2217,10 +2307,16 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
   const safeMarkField = markField || "redisSeeded";
   const safeMarkAtField = markAtField || "redisSeededAt";
   const collection = db.collection(collectionName);
-  const query = {
-    [fieldName]: { $exists: true, $ne: null },
-    [safeMarkField]: { $ne: true }
+  const careerLinksCollection = db.collection(collections.careerLinks);
+  const baseQuery = {
+    [fieldName]: { $exists: true, $ne: null }
   };
+  const query = includeSeeded
+    ? baseQuery
+    : {
+      ...baseQuery,
+      [safeMarkField]: { $ne: true }
+    };
   const hasCandidate = await collection.findOne(query, { projection: { _id: 1 } });
   if (!hasCandidate) {
     const hasField = await collection.findOne(
@@ -2236,10 +2332,16 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
       log("No unseeded documents found.", {
         collection: collectionName,
         field: fieldName,
-        markField: safeMarkField
+        markField: safeMarkField,
+        includeSeeded
       });
     }
-    return;
+    return {
+      totalQueued: 0,
+      totalFilteredAsCompleted: 0,
+      includeSeeded,
+      skipCompletedByCareerLinks
+    };
   }
   let cursor = collection.find(query, { projection: { [fieldName]: 1 } });
   if (safeBatchSize > 0) {
@@ -2250,7 +2352,9 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
   }
 
   let count = 0;
+  let filteredAsCompleted = 0;
   let batch = [];
+  const shouldUpdateMarks = !includeSeeded;
 
   const flushBatch = async () => {
     if (!batch.length) {
@@ -2263,30 +2367,48 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
       batch = [];
       return;
     }
-    await streamAddBatch(redisClient, queues.careerPages, urls);
-    const updates = [];
-    for (const doc of validDocs) {
-      updates.push({
-        updateOne: {
-          filter: { _id: doc._id },
-          update: {
-            $set: {
-              [safeMarkField]: true,
-              [safeMarkAtField]: now
+    let queueUrls = urls;
+    if (skipCompletedByCareerLinks) {
+      const completedKeys = await findCompletedCareerLinkKeySet(
+        careerLinksCollection,
+        urls
+      );
+      queueUrls = urls.filter((url) => !completedKeys.has(buildLinkDedupeKey(url)));
+      filteredAsCompleted += urls.length - queueUrls.length;
+    }
+    if (queueUrls.length) {
+      await streamAddBatch(redisClient, queues.careerPages, queueUrls);
+    }
+    if (shouldUpdateMarks) {
+      const updates = [];
+      for (const doc of validDocs) {
+        updates.push({
+          updateOne: {
+            filter: { _id: doc._id },
+            update: {
+              $set: {
+                [safeMarkField]: true,
+                [safeMarkAtField]: now
+              }
             }
           }
-        }
-      });
+        });
+      }
+      if (updates.length) {
+        await collection.bulkWrite(updates, { ordered: false });
+      }
     }
-    if (updates.length) {
-      await collection.bulkWrite(updates, { ordered: false });
-    }
-    count += urls.length;
+    count += queueUrls.length;
     log("Seeded mongo batch.", {
-      batchCount: urls.length,
+      batchCount: queueUrls.length,
+      rawBatchCount: urls.length,
+      filteredAsCompletedBatch: urls.length - queueUrls.length,
       totalCount: count,
+      totalFilteredAsCompleted: filteredAsCompleted,
       queue: queues.careerPages,
-      collection: collectionName
+      collection: collectionName,
+      includeSeeded,
+      skipCompletedByCareerLinks
     });
     batch = [];
   };
@@ -2301,11 +2423,20 @@ async function seedFromMongo(redisClient, db, collectionName, fieldName, options
 
   log("Seeded urls from mongo.", {
     count,
+    filteredAsCompleted,
     queue: queues.careerPages,
     collection: collectionName,
     markField: safeMarkField,
-    markAtField: safeMarkAtField
+    markAtField: safeMarkAtField,
+    includeSeeded,
+    skipCompletedByCareerLinks
   });
+  return {
+    totalQueued: count,
+    totalFilteredAsCompleted: filteredAsCompleted,
+    includeSeeded,
+    skipCompletedByCareerLinks
+  };
 }
 
 async function runLinksWorker(args) {
@@ -2828,11 +2959,41 @@ async function runHtmlWorker(args) {
           let careerUrl = null;
           try {
             const parsed = parseQueueItem(messageValue);
-            jobUrl = parsed.url;
+            jobUrl = normalizeLink(parsed.url) || parsed.url;
             careerUrl = parsed.careerUrl;
             if (!jobUrl) {
               shouldAck = true;
               return;
+            }
+            const existingJobState = await jobLinksCollection.findOne(
+              { url: jobUrl },
+              {
+                projection: {
+                  htmlStatus: 1,
+                  careerUrl: 1,
+                  careerUrls: 1
+                }
+              }
+            );
+            if (
+              existingJobState &&
+              (existingJobState.htmlStatus === "done" ||
+                existingJobState.htmlStatus === "skipped")
+            ) {
+              shouldAck = true;
+              log("Skipped already-completed html job.", {
+                url: jobUrl,
+                htmlStatus: existingJobState.htmlStatus
+              });
+              return;
+            }
+            if (!careerUrl && existingJobState) {
+              careerUrl =
+                existingJobState.careerUrl ||
+                (Array.isArray(existingJobState.careerUrls) &&
+                existingJobState.careerUrls.length
+                  ? existingJobState.careerUrls[0]
+                  : null);
             }
             if (
               settings.skipNonJobLinksInHtmlWorkers &&
@@ -3236,25 +3397,34 @@ async function seedJobLinksToHtmlQueue(args) {
   const useDedupe = parseBoolean(args["use-dedupe"], false);
   const includeQueued = parseBoolean(args["include-queued"], false);
   const resetQueued = parseBoolean(args["reset-queued"], false);
+  const watch = parseBoolean(args.watch, false);
+  const pollMs = toPositiveInt(
+    args["poll-ms"] || args.pollMs,
+    settings.htmlMongoPollMs
+  );
+  const recoverWhenEmpty = parseBoolean(
+    args["recover-when-empty"] !== undefined
+      ? args["recover-when-empty"]
+      : args.recoverWhenEmpty,
+    watch
+  );
+  const staleQueuedMs = toPositiveInt(
+    args["stale-queued-ms"] ||
+      args.staleQueuedMs ||
+      args["requeue-stale-ms"] ||
+      args.requeueStaleMs ||
+      pipelineConfig.seed_job_links_stale_queued_ms,
+    4 * 60 * 60 * 1000
+  );
 
   let totalQueued = 0;
-  let batch = [];
   const baseStatusQuery = {
     url: { $exists: true, $ne: null },
     htmlStatus: { $nin: ["done", "skipped"] }
   };
-  const query = {
-    ...baseStatusQuery,
-    ...(includeQueued ? {} : { htmlQueued: { $ne: true } })
-  };
-  let cursor = jobLinksCollection.find(query, {
-    projection: { url: 1, careerUrl: 1 },
-    sort: { _id: 1 }
-  });
-  if (max > 0) {
-    cursor = cursor.limit(max);
-  }
-  cursor = cursor.batchSize(batchSize);
+  let totalScanned = 0;
+  let cycle = 0;
+  let resetApplied = false;
   await ensurePipelineIndexes(db);
 
   await ensureStreamGroup(
@@ -3262,118 +3432,203 @@ async function seedJobLinksToHtmlQueue(args) {
     queues.careerLinks,
     streamGroups.careerLinks
   );
-  if (resetQueued) {
-    const resetResult = await jobLinksCollection.updateMany(
-      baseStatusQuery,
-      {
-        $unset: {
-          htmlQueued: "",
-          htmlQueuedAt: ""
+
+  const runSeedCycle = async (options = {}) => {
+    const forceIncludeQueued = Boolean(options.forceIncludeQueued);
+    const includeQueuedInCycle = includeQueued || forceIncludeQueued;
+    const staleThreshold = new Date(Date.now() - staleQueuedMs);
+    const query = includeQueuedInCycle
+      ? { ...baseStatusQuery }
+      : {
+        ...baseStatusQuery,
+        $or: [
+          { htmlQueued: { $ne: true } },
+          { htmlQueuedAt: { $exists: false } },
+          { htmlQueuedAt: { $lte: staleThreshold } }
+        ]
+      };
+    const remaining = max > 0 ? Math.max(0, max - totalQueued) : 0;
+    if (max > 0 && remaining <= 0) {
+      return {
+        queued: 0,
+        scanned: 0,
+        includeQueuedInCycle,
+        reachedMax: true
+      };
+    }
+    let cursor = jobLinksCollection.find(query, {
+      projection: { url: 1, careerUrl: 1 },
+      sort: { _id: 1 }
+    });
+    if (max > 0) {
+      cursor = cursor.limit(remaining);
+    }
+    cursor = cursor.batchSize(batchSize);
+
+    let batch = [];
+    let cycleQueued = 0;
+    let cycleScanned = 0;
+
+    const flushBatch = async () => {
+      if (!batch.length) {
+        return;
+      }
+      const now = new Date();
+      const valid = batch.filter((doc) => Boolean(doc.url));
+      if (!valid.length) {
+        batch = [];
+        return;
+      }
+      cycleScanned += valid.length;
+      const dedupedMap = new Map();
+      for (const doc of valid) {
+        const normalizedUrl = normalizeLink(doc.url);
+        if (!normalizedUrl) {
+          continue;
+        }
+        const dedupeKey = buildLinkDedupeKey(normalizedUrl);
+        if (!dedupeKey) {
+          continue;
+        }
+        if (!dedupedMap.has(dedupeKey)) {
+          dedupedMap.set(dedupeKey, {
+            url: normalizedUrl,
+            careerUrl: doc.careerUrl || ""
+          });
+          continue;
+        }
+        const existing = dedupedMap.get(dedupeKey);
+        existing.url = selectPreferredLink(existing.url, normalizedUrl);
+        if (!existing.careerUrl && doc.careerUrl) {
+          existing.careerUrl = doc.careerUrl;
         }
       }
-    );
-    log("Reset htmlQueued flags for pending links.", {
-      matched: resetResult.matchedCount,
-      modified: resetResult.modifiedCount
-    });
-  }
-
-  const flushBatch = async () => {
-    if (!batch.length) {
-      return;
-    }
-    const now = new Date();
-    const valid = batch.filter((doc) => Boolean(doc.url));
-    if (!valid.length) {
-      batch = [];
-      return;
-    }
-    const dedupedMap = new Map();
-    for (const doc of valid) {
-      const normalizedUrl = normalizeLink(doc.url);
-      if (!normalizedUrl) {
-        continue;
-      }
-      const dedupeKey = buildLinkDedupeKey(normalizedUrl);
-      if (!dedupeKey) {
-        continue;
-      }
-      if (!dedupedMap.has(dedupeKey)) {
-        dedupedMap.set(dedupeKey, {
-          url: normalizedUrl,
-          careerUrl: doc.careerUrl || ""
-        });
-        continue;
-      }
-      const existing = dedupedMap.get(dedupeKey);
-      existing.url = selectPreferredLink(existing.url, normalizedUrl);
-      if (!existing.careerUrl && doc.careerUrl) {
-        existing.careerUrl = doc.careerUrl;
-      }
-    }
-    const dedupedValid = Array.from(dedupedMap.values()).filter(
-      (doc) => Boolean(doc.url)
-    );
-    if (!dedupedValid.length) {
-      batch = [];
-      return;
-    }
-    let batchQueuedCount = dedupedValid.length;
-    if (useDedupe) {
-      const entries = dedupedValid.map((doc) => ({
-        value: doc.url,
-        streamValue: buildQueuePayload(doc.url, doc.careerUrl)
-      }));
-      batchQueuedCount = await saddAndStreamBatch(
-        redisClient,
-        queues.careerLinksDedup,
-        queues.careerLinks,
-        entries
+      const dedupedValid = Array.from(dedupedMap.values()).filter(
+        (doc) => Boolean(doc.url)
       );
-    } else {
-      const payloads = dedupedValid.map((doc) =>
-        buildQueuePayload(doc.url, doc.careerUrl)
-      );
-      await streamAddBatch(redisClient, queues.careerLinks, payloads);
-    }
+      if (!dedupedValid.length) {
+        batch = [];
+        return;
+      }
+      let batchQueuedCount = dedupedValid.length;
+      if (useDedupe) {
+        const entries = dedupedValid.map((doc) => ({
+          value: doc.url,
+          streamValue: buildQueuePayload(doc.url, doc.careerUrl)
+        }));
+        batchQueuedCount = await saddAndStreamBatch(
+          redisClient,
+          queues.careerLinksDedup,
+          queues.careerLinks,
+          entries
+        );
+      } else {
+        const payloads = dedupedValid.map((doc) =>
+          buildQueuePayload(doc.url, doc.careerUrl)
+        );
+        await streamAddBatch(redisClient, queues.careerLinks, payloads);
+      }
 
-    const updates = valid.map((doc) => ({
-      updateOne: {
-        filter: { _id: doc._id },
-        update: {
-          $set: {
-            htmlQueued: true,
-            htmlQueuedAt: now,
-            updatedAt: now
+      const updates = valid.map((doc) => ({
+        updateOne: {
+          filter: { _id: doc._id },
+          update: {
+            $set: {
+              htmlQueued: true,
+              htmlQueuedAt: now,
+              updatedAt: now
+            }
           }
         }
+      }));
+      if (updates.length) {
+        await jobLinksCollection.bulkWrite(updates, { ordered: false });
       }
-    }));
-    if (updates.length) {
-      await jobLinksCollection.bulkWrite(updates, { ordered: false });
-    }
-    totalQueued += batchQueuedCount;
-    log("Queued job links batch for html worker.", {
-      batchSize: valid.length,
-      dedupedBatchSize: dedupedValid.length,
-      queuedInRedis: batchQueuedCount,
-      totalQueued
-    });
-    batch = [];
-  };
+      totalQueued += batchQueuedCount;
+      cycleQueued += batchQueuedCount;
+      log("Queued job links batch for html worker.", {
+        batchSize: valid.length,
+        dedupedBatchSize: dedupedValid.length,
+        queuedInRedis: batchQueuedCount,
+        totalQueued,
+        includeQueuedInCycle
+      });
+      batch = [];
+    };
 
-  try {
     for await (const doc of cursor) {
       batch.push(doc);
       if (batch.length >= batchSize) {
         await flushBatch();
       }
+      if (max > 0 && totalQueued >= max) {
+        break;
+      }
     }
     await flushBatch();
+    totalScanned += cycleScanned;
+    return {
+      queued: cycleQueued,
+      scanned: cycleScanned,
+      includeQueuedInCycle,
+      reachedMax: max > 0 && totalQueued >= max
+    };
+  };
+
+  try {
+    while (true) {
+      cycle += 1;
+      if (resetQueued && !resetApplied) {
+        const resetResult = await jobLinksCollection.updateMany(
+          baseStatusQuery,
+          {
+            $unset: {
+              htmlQueued: "",
+              htmlQueuedAt: ""
+            }
+          }
+        );
+        resetApplied = true;
+        log("Reset htmlQueued flags for pending links.", {
+          matched: resetResult.matchedCount,
+          modified: resetResult.modifiedCount
+        });
+      }
+
+      let forceIncludeQueued = false;
+      let streamLength = null;
+      if (recoverWhenEmpty) {
+        streamLength = await getStreamLengthSafe(redisClient, queues.careerLinks);
+        if (streamLength === 0) {
+          forceIncludeQueued = true;
+        }
+      }
+
+      const cycleResult = await runSeedCycle({ forceIncludeQueued });
+      log("Job links seed cycle completed.", {
+        cycle,
+        queued: cycleResult.queued,
+        scanned: cycleResult.scanned,
+        totalQueued,
+        totalScanned,
+        includeQueuedInCycle: cycleResult.includeQueuedInCycle,
+        recoverWhenEmpty,
+        streamLength
+      });
+
+      if (!watch || cycleResult.reachedMax) {
+        break;
+      }
+      await sleep(pollMs);
+    }
     log("Queued job links for html worker.", {
       totalQueued,
+      totalScanned,
       queue: queues.careerLinks,
-      dedupe: useDedupe
+      dedupe: useDedupe,
+      watch,
+      recoverWhenEmpty,
+      staleQueuedMs
     });
   } finally {
     await redisClient.quit();
@@ -3762,9 +4017,12 @@ async function main() {
     console.log("  node pipeline/index.js seed --file <path>");
     console.log("  node pipeline/index.js seed --collection <name> --field <field> [--batch-size <n>] [--max <n>]");
     console.log("                             [--mark-field <name>] [--mark-at-field <name>]");
+    console.log("                             [--include-seeded] [--resume-from-results] [--watch] [--poll-ms <n>]");
+    console.log("                             [--recover-when-empty]");
     console.log("  node pipeline/index.js worker:links [--once] [--max <n>]");
     console.log("  node pipeline/index.js seed:job-links [--batch-size <n>] [--max <n>] [--use-dedupe]");
-    console.log("                             [--include-queued] [--reset-queued]");
+    console.log("                             [--include-queued] [--reset-queued] [--watch] [--poll-ms <n>]");
+    console.log("                             [--recover-when-empty] [--stale-queued-ms <n>]");
     console.log("  node pipeline/index.js seed:failed-links [--batch-size <n>] [--max <n>] [--keep-failed]");
     console.log("  node pipeline/index.js worker:html [--once] [--max <n>] [--source redis|mongo]");
     console.log("  node pipeline/index.js worker:html-mongo [--once] [--max <n>]");
@@ -3799,6 +4057,24 @@ async function main() {
       args.markAtField ||
       (pipelineConfig.seed && pipelineConfig.seed.mark_at_field) ||
       "redisSeededAt";
+    const includeSeeded = parseBoolean(
+      args["include-seeded"] !== undefined ? args["include-seeded"] : args.includeSeeded,
+      false
+    );
+    const resumeFromResults = parseBoolean(
+      args["resume-from-results"] !== undefined
+        ? args["resume-from-results"]
+        : args.resumeFromResults,
+      false
+    );
+    const watch = parseBoolean(args.watch, false);
+    const pollMs = toPositiveInt(args["poll-ms"] || args.pollMs, settings.htmlMongoPollMs);
+    const recoverWhenEmpty = parseBoolean(
+      args["recover-when-empty"] !== undefined
+        ? args["recover-when-empty"]
+        : args.recoverWhenEmpty,
+      watch
+    );
 
     try {
       await ensureStreamGroup(
@@ -3807,6 +4083,11 @@ async function main() {
         streamGroups.careerPages
       );
       if (filePath) {
+        if (watch) {
+          log("Watch mode is ignored when seeding from file.", {
+            file: filePath
+          });
+        }
         await seedFromFile(redisClient, filePath);
       } else {
         const { client: mongoClient, db } = await connectMongo(
@@ -3820,7 +4101,10 @@ async function main() {
               db,
               fallbackCollections,
               fieldName,
-              markField
+              markField,
+              {
+                includeSeeded
+              }
             );
             collectionName = selection.name || fallbackCollections[0];
             log("Selected seed collection.", {
@@ -3831,20 +4115,69 @@ async function main() {
           if (!collectionName) {
             throw new Error("No mongo collection available for seeding.");
           }
-          log("Seed settings.", {
-            collection: collectionName,
-            field: fieldName,
-            batchSize,
-            max,
-            markField,
-            markAtField
-          });
-          await seedFromMongo(redisClient, db, collectionName, fieldName, {
-            batchSize,
-            max,
-            markField,
-            markAtField
-          });
+          let cycle = 0;
+          let totalQueued = 0;
+          let totalFilteredAsCompleted = 0;
+          while (true) {
+            cycle += 1;
+            const forceRecovery = recoverWhenEmpty
+              ? (await getStreamLengthSafe(redisClient, queues.careerPages)) === 0
+              : false;
+            const includeSeededInCycle = includeSeeded || forceRecovery;
+            const resumeFromResultsInCycle = resumeFromResults || forceRecovery;
+            const remainingMax = max > 0 ? Math.max(0, max - totalQueued) : 0;
+            if (max > 0 && remainingMax <= 0) {
+              break;
+            }
+            log("Seed settings.", {
+              cycle,
+              collection: collectionName,
+              field: fieldName,
+              batchSize,
+              max: max > 0 ? remainingMax : 0,
+              markField,
+              markAtField,
+              includeSeeded: includeSeededInCycle,
+              resumeFromResults: resumeFromResultsInCycle,
+              recoverWhenEmpty,
+              watch
+            });
+            const result = await seedFromMongo(
+              redisClient,
+              db,
+              collectionName,
+              fieldName,
+              {
+                batchSize,
+                max: max > 0 ? remainingMax : 0,
+                markField,
+                markAtField,
+                includeSeeded: includeSeededInCycle,
+                skipCompletedByCareerLinks: resumeFromResultsInCycle
+              }
+            );
+            totalQueued += Number(result && result.totalQueued ? result.totalQueued : 0);
+            totalFilteredAsCompleted += Number(
+              result && result.totalFilteredAsCompleted
+                ? result.totalFilteredAsCompleted
+                : 0
+            );
+            log("Seed cycle completed.", {
+              cycle,
+              queuedInCycle: Number(result && result.totalQueued ? result.totalQueued : 0),
+              filteredAsCompletedInCycle: Number(
+                result && result.totalFilteredAsCompleted
+                  ? result.totalFilteredAsCompleted
+                  : 0
+              ),
+              totalQueued,
+              totalFilteredAsCompleted
+            });
+            if (!watch) {
+              break;
+            }
+            await sleep(pollMs);
+          }
         } finally {
           await mongoClient.close();
         }

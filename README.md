@@ -58,6 +58,11 @@ Additional diagrams are in `docs/PIPELINE_FLOW.md`.
 npm run seed -- --collection <collection_name> --field careerUrl --batch-size 1000
 ```
 
+- Resume career-page seeding after Redis loss (skip already completed pages):
+```bash
+node pipeline/index.js seed --collection <collection_name> --field careerUrl --batch-size 1000 --include-seeded --resume-from-results
+```
+
 - Seed from file:
 ```bash
 npm run seed -- --file ./urls.txt
@@ -93,6 +98,11 @@ node pipeline/index.js health --json
 npm run seed:job-links -- --batch-size 2000
 ```
 
+- Resume HTML queue after Redis loss (reseed pending/incomplete docs):
+```bash
+node pipeline/index.js seed:job-links --batch-size 2000 --include-queued
+```
+
 - Replay failed links-worker jobs from Redis failed stream:
 ```bash
 node pipeline/index.js seed:failed-links --batch-size 2000
@@ -101,6 +111,12 @@ node pipeline/index.js seed:failed-links --batch-size 2000
 - Force reseed of pending HTML queue flags:
 ```bash
 npm run seed:job-links -- --reset-queued --batch-size 2000
+```
+
+- Run resumable queue seeders in PM2 (auto-recover when stream is empty):
+```bash
+pm2 start pipeline/index.js --name seed-career-pages -- seed --collection <collection_name> --field careerUrl --batch-size 1000 --watch --poll-ms 30000 --recover-when-empty --resume-from-results
+pm2 start pipeline/index.js --name seed-job-links -- seed:job-links --batch-size 2000 --watch --poll-ms 15000 --recover-when-empty --stale-queued-ms 14400000
 ```
 
 ## Quick Start (CLI Style You Are Using)
@@ -148,6 +164,7 @@ pm2 start pipeline/index.js -i 8 --name worker-html -- worker:html
 - URL variants are canonicalized for dedupe (for example `http`/`https`, default ports, trailing slash), with `https` preferred when both exist.
 - The crawled career URL (and its `http`/`https` variants) is removed from stored `links` to avoid self-link duplicates.
 - ATS links are canonicalized to main board URLs (for example Lever/Workday/Oracle/ADP), so `atsCareerLinks` does not store job-detail/filter-query variants.
+- Seed commands support recovery mode to reseed pending work when Redis stream data is lost (`--recover-when-empty`, `--include-seeded`, `--resume-from-results`).
 - Requests rotate across a larger desktop/mobile User-Agent pool to reduce provider-specific blocking.
 - Domain-level exclusions are applied from `expireExcludeDomains.json`.
 - Expired/no-jobs page detection is applied from `expireKeywords.json`.
@@ -193,6 +210,10 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `STREAM_NON_RETRYABLE_EXTENSIONS`: comma-separated file extensions that should not be retried (for example `.zip,.pdf,.jpg`).
 - `HEALTH_STATS_KEY`: Redis hash key used to store retry counters for health checks.
 - `CAREER_PAGES_FAILED_QUEUE`: Redis stream key used for parked links-worker failures.
+- `seed --include-seeded --resume-from-results`: reseed from source collection while skipping URLs already marked `crawlStatus=success` in `career_links`.
+- `seed --watch --recover-when-empty`: keep a PM2 seeder running and auto-recover when `career:pages` stream is empty.
+- `seed:job-links --watch --recover-when-empty`: keep HTML queue seeder running and auto-recover when `career:links` stream is empty.
+- `seed:job-links --stale-queued-ms <n>`: requeue docs with old `htmlQueuedAt` even if `htmlQueued=true` (default `4h`).
 
 ## Mongo Collections and Meaning
 
@@ -257,3 +278,5 @@ If you use `seed:job-links`, default is `--use-dedupe false` so old Redis dedupe
 - No records seeded: check `--collection`, `--field`, and mark fields (`redisSeeded`, `redisSeededAt`).
 - HTML workers idle in mongo mode: check `career_link_jobs.htmlStatus` values and lock timestamps.
 - Redis HTML workers not receiving jobs: ensure `seed:job-links` has run (or set `ENQUEUE_HTML_FROM_LINKS_WORKER=true`).
+- Redis stream data flushed/deleted: rerun `seed --include-seeded --resume-from-results` and `seed:job-links --include-queued` to rebuild pending queues from Mongo state.
+- For automatic recovery in PM2, run seeders in watch mode with `--recover-when-empty`.
