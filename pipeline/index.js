@@ -783,6 +783,43 @@ function isLikelyJobLink(url) {
   );
 }
 
+function isBotChallengeLink(link) {
+  if (!link) {
+    return false;
+  }
+  const lower = String(link).toLowerCase();
+  return (
+    lower.includes("/.well-known/sgcaptcha") ||
+    lower.includes("sgcaptcha") ||
+    lower.includes("cf-chl") ||
+    lower.includes("challenge-platform") ||
+    lower.includes("_incapsula_resource") ||
+    lower.includes("distil_r_captcha") ||
+    lower.includes("/captcha")
+  );
+}
+
+function isLikelyBotChallengeResult(links, jobLinks) {
+  if (!Array.isArray(links) || !links.length) {
+    return false;
+  }
+  if (Array.isArray(jobLinks) && jobLinks.length) {
+    return false;
+  }
+  const challengeCount = links.reduce(
+    (count, link) => count + (isBotChallengeLink(link) ? 1 : 0),
+    0
+  );
+  if (challengeCount <= 0) {
+    return false;
+  }
+  if (links.length <= 3) {
+    return true;
+  }
+  const nonChallengeCount = links.length - challengeCount;
+  return nonChallengeCount <= 0;
+}
+
 function isExternalLinkToCareer(link, careerUrl) {
   try {
     const linkHost = new URL(link).hostname.replace(/^www\./i, "").toLowerCase();
@@ -1618,6 +1655,11 @@ async function runLinksWorker(args) {
               jobLinks = Array.from(new Set([...jobLinks, ...expandedJobLinks]));
               normalizedLinks = Array.from(
                 new Set([...normalizedLinks, ...expandedJobLinks])
+              );
+            }
+            if (isLikelyBotChallengeResult(rawNormalizedLinks, jobLinks)) {
+              throw new Error(
+                "Bot challenge detected while fetching career page; retrying."
               );
             }
 
