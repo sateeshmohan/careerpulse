@@ -18,6 +18,7 @@ const {
   streamReadGroupBatch,
   streamAutoClaimBatch,
   streamAck,
+  streamMoveBatch,
   saddAndStreamBatch
 } = require("./redis_queue");
 const { connectMongo } = require("./mongo_client");
@@ -50,6 +51,10 @@ const queues = {
     process.env.CAREER_LINKS_QUEUE ||
     (pipelineConfig.queues && pipelineConfig.queues.career_links) ||
     "career:links",
+  careerPagesFailed:
+    process.env.CAREER_PAGES_FAILED_QUEUE ||
+    (pipelineConfig.queues && pipelineConfig.queues.career_pages_failed) ||
+    "career:pages:failed",
   careerLinksDedup:
     process.env.CAREER_LINKS_DEDUP_QUEUE ||
     (pipelineConfig.queues && pipelineConfig.queues.career_links_dedupe) ||
@@ -97,10 +102,21 @@ const settings = {
       ? pipelineConfig.same_domain_only
       : true
   ),
+  keepExternalLikelyJobLinks: parseBoolean(
+    process.env.KEEP_EXTERNAL_LIKELY_JOB_LINKS,
+    pipelineConfig.keep_external_likely_job_links !== undefined
+      ? pipelineConfig.keep_external_likely_job_links
+      : true
+  ),
   minLinksForGot: Number(
     process.env.MIN_GOT_LINKS ||
     pipelineConfig.min_links_for_got ||
     5
+  ),
+  minLikelyJobLinksForGot: Number(
+    process.env.MIN_LIKELY_JOB_LINKS_FOR_GOT ||
+    pipelineConfig.min_likely_job_links_for_got ||
+    1
   ),
   linksFetchMode: parseFetchMode(
     process.env.LINKS_FETCH_MODE ||
@@ -554,6 +570,20 @@ async function retryStreamMessage(
   return { requeued: true, reason: "requeued", retryCount: nextRetryCount };
 }
 
+async function parkFailedStreamMessage(redisClient, streamKey, value, context = {}) {
+  await streamAdd(redisClient, streamKey, value);
+  await incrementHealthCounter(redisClient, "failed_parked_total", 1);
+  await incrementHealthCounter(
+    redisClient,
+    `${streamKey}:failed_parked`,
+    1
+  );
+  log("Parked failed stream message.", {
+    stream: streamKey,
+    ...context
+  });
+}
+
 function getBatchSize(value, fallback) {
   return toPositiveInt(value, fallback);
 }
@@ -674,7 +704,13 @@ function filterSameDomain(links, baseUrl) {
   return links.filter((link) => {
     try {
       const host = new URL(link).hostname.replace(/^www\./i, "");
-      return baseHost === host;
+      if (baseHost === host) {
+        return true;
+      }
+      if (settings.keepExternalLikelyJobLinks && isLikelyJobLink(link)) {
+        return true;
+      }
+      return false;
     } catch (error) {
       return false;
     }
@@ -1124,7 +1160,7 @@ async function fetchCareerLinks(url) {
       timeoutMs: settings.gotTimeoutMs
     });
     const links = extractLinksFromHtml(gotResult.html, url, {
-      sameDomainOnly: settings.sameDomainOnly
+      sameDomainOnly: false
     });
     return {
       links,
@@ -1139,18 +1175,29 @@ async function fetchCareerLinks(url) {
       timeoutMs: settings.gotTimeoutMs
     });
     const links = extractLinksFromHtml(gotResult.html, url, {
-      sameDomainOnly: settings.sameDomainOnly
+      sameDomainOnly: false
     });
-    if (links.length >= settings.minLinksForGot) {
+    const likelyJobLinks = filterJobLinks(links, {
+      strongPatterns: settings.jobLinkStrongPatterns,
+      weakPatterns: settings.jobLinkWeakPatterns,
+      excludePatterns: settings.jobLinkExcludePatterns
+    });
+    const hasEnoughLikelyJobs =
+      settings.minLikelyJobLinksForGot <= 0 ||
+      likelyJobLinks.length >= settings.minLikelyJobLinksForGot;
+    if (links.length >= settings.minLinksForGot && hasEnoughLikelyJobs) {
       return {
         links,
         source: "got",
         userAgent: gotResult.userAgent
       };
     }
-    log("Got returned few links, falling back to puppeteer.", {
+    log("Got did not meet link quality threshold, falling back to puppeteer.", {
       url,
-      count: links.length
+      count: links.length,
+      likelyJobLinkCount: likelyJobLinks.length,
+      minLinksForGot: settings.minLinksForGot,
+      minLikelyJobLinksForGot: settings.minLikelyJobLinksForGot
     });
   } catch (error) {
     log("Got failed, falling back to puppeteer.", {
@@ -1499,6 +1546,17 @@ async function runLinksWorker(args) {
                   1
                 );
               }
+              await parkFailedStreamMessage(
+                redisClient,
+                queues.careerPagesFailed,
+                decodedMessage.value || url,
+                {
+                  id: message.id,
+                  url,
+                  retryCount: decodedMessage.retryCount,
+                  reason: requeued.reason
+                }
+              );
               await collection.updateOne(
                 { careerUrl: url },
                 buildCareerLinksErrorUpdate(url, error, startedAt),
@@ -2123,6 +2181,72 @@ async function seedJobLinksToHtmlQueue(args) {
   }
 }
 
+async function seedFailedCareerPages(args) {
+  const redisClient = await createRedisClient(redisUrl);
+  const batchSize = toPositiveInt(
+    args["batch-size"] || args.batchSize,
+    settings.redisEnqueueBatchSize
+  );
+  const max = Number(args.max || 0);
+  const keepFailed = parseBoolean(
+    args["keep-failed"] !== undefined ? args["keep-failed"] : args.keepFailed,
+    false
+  );
+
+  let movedTotal = 0;
+  try {
+    await ensureStreamGroup(
+      redisClient,
+      queues.careerPages,
+      streamGroups.careerPages
+    );
+
+    if (keepFailed) {
+      const limit = max > 0 ? Math.min(batchSize, max) : batchSize;
+      movedTotal = await streamMoveBatch(
+        redisClient,
+        queues.careerPagesFailed,
+        queues.careerPages,
+        limit,
+        { deleteSource: false }
+      );
+      log("Requeued failed links batch (source retained).", {
+        moved: movedTotal,
+        source: queues.careerPagesFailed,
+        target: queues.careerPages
+      });
+      return;
+    }
+
+    while (true) {
+      const remaining = max > 0 ? max - movedTotal : batchSize;
+      if (remaining <= 0) {
+        break;
+      }
+      const limit = max > 0 ? Math.min(batchSize, remaining) : batchSize;
+      const moved = await streamMoveBatch(
+        redisClient,
+        queues.careerPagesFailed,
+        queues.careerPages,
+        limit,
+        { deleteSource: true }
+      );
+      if (!moved) {
+        break;
+      }
+      movedTotal += moved;
+      log("Requeued failed links batch.", {
+        moved,
+        totalMoved: movedTotal,
+        source: queues.careerPagesFailed,
+        target: queues.careerPages
+      });
+    }
+  } finally {
+    await redisClient.quit();
+  }
+}
+
 function parseRedisInfoSection(raw) {
   const out = {};
   if (!raw || typeof raw !== "string") {
@@ -2214,6 +2338,7 @@ async function collectRedisHealth(redisClient) {
     persistenceInfoRaw,
     pagesStream,
     linksStream,
+    failedPagesStream,
     dedupeType,
     retryCounters
   ] = await Promise.all([
@@ -2230,6 +2355,11 @@ async function collectRedisHealth(redisClient) {
       redisClient,
       queues.careerLinks,
       streamGroups.careerLinks
+    ),
+    getStreamHealthSnapshot(
+      redisClient,
+      queues.careerPagesFailed,
+      streamGroups.careerPages
     ),
     redisClient.type(queues.careerLinksDedup),
     redisClient.hGetAll(settings.healthStatsKey).catch(() => ({}))
@@ -2271,7 +2401,8 @@ async function collectRedisHealth(redisClient) {
     },
     streams: {
       careerPages: pagesStream,
-      careerLinks: linksStream
+      careerLinks: linksStream,
+      careerPagesFailed: failedPagesStream
     },
     dedupe: {
       key: queues.careerLinksDedup,
@@ -2347,7 +2478,11 @@ function printHealthReport(report) {
   console.log(
     `Redis Stats: evicted=${formatInt(redis.stats.evictedKeys)} expired=${formatInt(redis.stats.expiredKeys)} hits=${formatInt(redis.stats.keyspaceHits)} misses=${formatInt(redis.stats.keyspaceMisses)}`
   );
-  for (const stream of [redis.streams.careerPages, redis.streams.careerLinks]) {
+  for (const stream of [
+    redis.streams.careerPages,
+    redis.streams.careerLinks,
+    redis.streams.careerPagesFailed
+  ]) {
     const group = stream.group || {
       name: stream.groupName,
       pending: 0,
@@ -2430,6 +2565,7 @@ async function main() {
     console.log("  node pipeline/index.js worker:links [--once] [--max <n>]");
     console.log("  node pipeline/index.js seed:job-links [--batch-size <n>] [--max <n>] [--use-dedupe]");
     console.log("                             [--include-queued] [--reset-queued]");
+    console.log("  node pipeline/index.js seed:failed-links [--batch-size <n>] [--max <n>] [--keep-failed]");
     console.log("  node pipeline/index.js worker:html [--once] [--max <n>] [--source redis|mongo]");
     console.log("  node pipeline/index.js worker:html-mongo [--once] [--max <n>]");
     console.log("       optional: [--retry-errors] [--retry-delay-ms <n>] [--poll-ms <n>] [--lock-ms <n>]");
@@ -2526,6 +2662,11 @@ async function main() {
 
   if (command === "seed:job-links") {
     await seedJobLinksToHtmlQueue(args);
+    return;
+  }
+
+  if (command === "seed:failed-links") {
+    await seedFailedCareerPages(args);
     return;
   }
 

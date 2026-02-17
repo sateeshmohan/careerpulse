@@ -305,6 +305,53 @@ async function streamAck(client, streamKey, group, id, options = {}) {
   return acked;
 }
 
+async function streamMoveBatch(
+  client,
+  sourceStreamKey,
+  targetStreamKey,
+  count = 100,
+  options = {}
+) {
+  const safeCount = Number.isFinite(Number(count))
+    ? Math.max(1, Math.floor(Number(count)))
+    : 100;
+  const deleteSource = options.deleteSource !== false;
+  const moved = await client.eval(
+    `
+      local sourceStream = KEYS[1]
+      local targetStream = KEYS[2]
+      local limit = tonumber(ARGV[1]) or 100
+      local shouldDelete = ARGV[2] == "1"
+      local entries = redis.call("XRANGE", sourceStream, "-", "+", "COUNT", limit)
+      local total = 0
+      for _, entry in ipairs(entries) do
+        local id = entry[1]
+        local fields = entry[2]
+        local value = nil
+        for i = 1, #fields, 2 do
+          if fields[i] == "value" then
+            value = fields[i + 1]
+            break
+          end
+        end
+        if value ~= nil then
+          redis.call("XADD", targetStream, "*", "value", value)
+          total = total + 1
+        end
+        if shouldDelete then
+          redis.call("XDEL", sourceStream, id)
+        end
+      end
+      return total
+    `,
+    {
+      keys: [sourceStreamKey, targetStreamKey],
+      arguments: [String(safeCount), deleteSource ? "1" : "0"]
+    }
+  );
+  return Number(moved) || 0;
+}
+
 async function saddAndQueue(client, setKey, queueKey, value, queueValue = value) {
   const added = await client.sAdd(setKey, value);
   if (added) {
@@ -405,6 +452,7 @@ module.exports = {
   streamReadGroup,
   streamAutoClaimOne,
   streamAck,
+  streamMoveBatch,
   saddAndQueue,
   saddAndStream,
   saddAndStreamBatch

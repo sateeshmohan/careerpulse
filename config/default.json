@@ -100,6 +100,7 @@
     "pipeline": {
         "queues": {
             "career_pages": "career:pages",
+            "career_pages_failed": "career:pages:failed",
             "career_links": "career:links",
             "career_links_dedupe": "career:links:dedupe"
         },
@@ -170,7 +171,9 @@
             "job_links": "career_link_jobs"
         },
         "same_domain_only": true,
+        "keep_external_likely_job_links": true,
         "min_links_for_got": 5,
+        "min_likely_job_links_for_got": 1,
         "links_fetch_mode": "auto",
         "min_html_length": 1000,
         "got_timeout_ms": 20000,

@@ -1,9 +1,9 @@
 const got = require("got");
-const { randomUserAgent } = require("./user_agents");
+const { randomDesktopUserAgent } = require("./user_agents");
 
 async function fetchHtmlWithGot(url, options = {}) {
   const timeoutMs = options.timeoutMs || 20000;
-  const userAgent = options.userAgent || randomUserAgent();
+  const userAgent = options.userAgent || randomDesktopUserAgent();
 
   const response = await got(url, {
     headers: {

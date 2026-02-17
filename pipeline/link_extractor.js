@@ -44,6 +44,19 @@ function isSkippableHref(href) {
   );
 }
 
+function extractInlineLinksFromHandler(handlerText) {
+  if (!handlerText || typeof handlerText !== "string") {
+    return [];
+  }
+  const links = [];
+  const regex = /(['"])(https?:\/\/[^'"]+|\/\/[^'"]+|\/[^'"]+|\.\.?\/[^'"]+)\1/g;
+  let match = null;
+  while ((match = regex.exec(handlerText)) !== null) {
+    links.push(match[2]);
+  }
+  return links;
+}
+
 function extractLinksFromHtml(html, baseUrl, options = {}) {
   const {
     sameDomainOnly = true,
@@ -63,26 +76,48 @@ function extractLinksFromHtml(html, baseUrl, options = {}) {
 
   const baseHost = normalizeHost(new URL(baseUrl).hostname);
   const links = new Set();
-  const regex = /<a\b[^>]*\bhref\s*=\s*(['"]?)([^'"\s>]+)\1/gi;
-  let match = null;
-  while ((match = regex.exec(cleaned)) !== null) {
-    const rawHref = match[2];
+  const addResolvedLink = (rawHref) => {
     if (isSkippableHref(rawHref)) {
-      continue;
+      return;
     }
     let absoluteUrl = "";
     try {
       absoluteUrl = new URL(rawHref, baseUrl).toString();
     } catch (error) {
-      continue;
+      return;
     }
     if (sameDomainOnly) {
       const targetHost = normalizeHost(new URL(absoluteUrl).hostname);
       if (baseHost && targetHost && baseHost !== targetHost) {
-        continue;
+        return;
       }
     }
     links.add(absoluteUrl);
+  };
+
+  const regex = /<a\b[^>]*\bhref\s*=\s*(['"]?)([^'"\s>]+)\1/gi;
+  let match = null;
+  while ((match = regex.exec(cleaned)) !== null) {
+    addResolvedLink(match[2]);
+  }
+  const frameRegex = /<(?:iframe|frame)\b[^>]*\bsrc\s*=\s*(['"]?)([^'"\s>]+)\1/gi;
+  while ((match = frameRegex.exec(cleaned)) !== null) {
+    addResolvedLink(match[2]);
+  }
+
+  const dataUrlRegex =
+    /\b(?:data-href|data-url|data-link|data-job-url)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  while ((match = dataUrlRegex.exec(cleaned)) !== null) {
+    addResolvedLink(match[1] || match[2] || match[3]);
+  }
+
+  const handlerRegex = /\bon(?:click|keydown)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+  while ((match = handlerRegex.exec(cleaned)) !== null) {
+    const handler = match[1] || match[2] || "";
+    const inlineLinks = extractInlineLinksFromHandler(handler);
+    for (const inlineLink of inlineLinks) {
+      addResolvedLink(inlineLink);
+    }
   }
 
   return Array.from(links);

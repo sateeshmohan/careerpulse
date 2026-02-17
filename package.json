@@ -10,6 +10,7 @@
     "worker:links": "node pipeline/index.js worker:links",
     "worker:html": "node pipeline/index.js worker:html",
     "worker:html:mongo": "node pipeline/index.js worker:html-mongo",
+    "seed:failed-links": "node pipeline/index.js seed:failed-links",
     "health": "node pipeline/index.js health"
   },
   "dependencies": {
