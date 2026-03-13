@@ -226,6 +226,8 @@ Set these via environment variables (directly read by `pipeline/index.js`):
 - `careerLinksStatus`: `job_links_found` | `ats_career_links_found` | `expired_or_no_jobs` | `excluded_domain` | `no_job_links` | `error`
 - `jobDetailLinkCount`: count of detail-like job URLs (for example `/job/123`, `jobId=...`)
 - `atsCareerLinks`: detected ATS career-board links (Workday, Oracle CE, ADP, Entertime, etc.)
+- `finalCareerUrl`: preferred downstream career page URL; uses canonical ATS board URL when available, otherwise the best discovered career-like link, otherwise `finalUrl`.
+- `atsTemplate`: detected ATS vendor/template for `finalCareerUrl` (for example `workday`, `lever`, `greenhouse`); empty when the selected career URL is not a recognized ATS board.
 - `careerFilteredLinkCount`: number of URLs dropped by career-link URL filtering.
 - `atsFilteredLinkCount`: number of URLs dropped by ATS-link filtering.
 - `excludedDomainPattern`: matched pattern from `expireExcludeDomains.json` when domain exclusion is triggered.

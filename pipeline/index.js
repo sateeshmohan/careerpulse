@@ -30,12 +30,16 @@ const parseLdJson = require("../ldjson_parser");
 const { deleteSocialMediaUrls } = require("../delete_socialmedia_links");
 const { filterJobLinks } = require("./job_link_filter");
 const {
+  canonicalizeAtsCareerLink: canonicalizeAtsCareerLinkFromRules,
+  detectAtsTemplate: detectAtsTemplateFromRules,
   detectExpiredOrNoJobs,
   extractAtsCareerLinks: extractAtsCareerLinksFromRules,
   filterAtsCareerLinks: filterAtsCareerLinksFromRules,
   filterCareerLinks: filterCareerLinksFromRules,
   filterLinksByAnchorText,
+  hasCareerLikeSignal: hasCareerLikeSignalFromRules,
   isAtsCareerLink: isAtsCareerLinkFromRules,
+  isClearlyNonCareerLink: isClearlyNonCareerLinkFromRules,
   isExcludedDomain
 } = require("./career_link_rules");
 
@@ -1096,6 +1100,147 @@ function applyAtsLinksFilter(links) {
   };
 }
 
+const STRONG_CAREER_PATH_REGEX =
+  /(^|\/)(career|careers|job|jobs|join-us|work-with-us|current-openings|vacancies|opportunities|positions|employment)(\/|$|[-_])/i;
+const SUPPORTING_CAREER_PATH_REGEX =
+  /(opening|openings|apply|talent|hiring|recruit|candidateexperience|candidateportal|jobsearch|searchjobs|jobboard|job-board|joblist|listing)/i;
+const NON_CAREER_ARTICLE_PATH_REGEX =
+  /(announc|news|blog|press|article|story|event|webinar|case-stud|testimonial|investor|team|leadership|about|contact|privacy|terms|office)/i;
+
+function getComparableHost(link) {
+  try {
+    return new URL(String(link))
+      .hostname
+      .replace(/^www\./i, "")
+      .toLowerCase();
+  } catch (error) {
+    return "";
+  }
+}
+
+function scoreCareerUrlCandidate(link, baseCareerUrl) {
+  const normalized = normalizeLink(link);
+  if (!normalized) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch (error) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  const combined = `${parsed.pathname || ""}${parsed.search || ""}`.toLowerCase();
+  const lastSegment = String(parsed.pathname || "")
+    .split("/")
+    .filter(Boolean)
+    .pop() || "";
+  const slugWordCount = lastSegment
+    .split(/[-_]+/)
+    .map((part) => part.trim())
+    .filter(Boolean).length;
+  const sameHost =
+    Boolean(baseCareerUrl) && getComparableHost(normalized) === getComparableHost(baseCareerUrl);
+  const strongCareerHint = STRONG_CAREER_PATH_REGEX.test(combined);
+  const supportingCareerHint = SUPPORTING_CAREER_PATH_REGEX.test(combined);
+
+  if (
+    isClearlyNonCareerLinkFromRules(normalized) &&
+    !strongCareerHint &&
+    !supportingCareerHint
+  ) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  let score = 0;
+  if (sameHost) {
+    score += 20;
+  }
+  if (parsed.protocol === "https:") {
+    score += 8;
+  }
+  if (!parsed.search) {
+    score += 3;
+  }
+  if (isAtsCareerLink(normalized)) {
+    score += 200;
+  }
+  if (strongCareerHint) {
+    score += 120;
+  } else if (supportingCareerHint || hasCareerLikeSignalFromRules(normalized)) {
+    score += 45;
+  }
+  if (/(listing|searchjobs|jobsearch|jobboard|job-board|joblist)/i.test(combined)) {
+    score += 15;
+  }
+  if (NON_CAREER_ARTICLE_PATH_REGEX.test(combined)) {
+    score -= 90;
+  }
+  if (lastSegment.length > 40) {
+    score -= 20;
+  }
+  if (slugWordCount > 4) {
+    score -= 25;
+  }
+  return score;
+}
+
+function selectBestCareerCandidate(candidates, baseCareerUrl, minimumScore = 60) {
+  const uniqueCandidates = dedupeLinksPreferHttps((candidates || []).filter(Boolean));
+  let bestLink = "";
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const candidate of uniqueCandidates) {
+    const score = scoreCareerUrlCandidate(candidate, baseCareerUrl);
+    if (score > bestScore) {
+      bestLink = candidate;
+      bestScore = score;
+      continue;
+    }
+    if (score === bestScore && selectPreferredLink(bestLink, candidate) === candidate) {
+      bestLink = candidate;
+    }
+  }
+
+  if (!bestLink || bestScore < minimumScore) {
+    return "";
+  }
+  return bestLink;
+}
+
+function resolveFinalCareerUrl(careerUrl, finalUrl, links = [], atsCareerLinks = []) {
+  const fallbackUrl =
+    normalizeLink(finalUrl) ||
+    normalizeLink(careerUrl) ||
+    String(finalUrl || careerUrl || "");
+  const canonicalAtsLinks = dedupeLinksPreferHttps(
+    [
+      isAtsCareerLink(finalUrl)
+        ? canonicalizeAtsCareerLinkFromRules(finalUrl)
+        : "",
+      ...(Array.isArray(atsCareerLinks) ? atsCareerLinks : []).map((link) =>
+        canonicalizeAtsCareerLinkFromRules(link)
+      )
+    ].filter(Boolean)
+  );
+
+  let preferredAtsLink = "";
+  for (const candidate of canonicalAtsLinks) {
+    preferredAtsLink = selectPreferredLink(preferredAtsLink, candidate);
+  }
+  if (preferredAtsLink) {
+    return preferredAtsLink;
+  }
+
+  const bestCareerLink = selectBestCareerCandidate(
+    Array.isArray(links) ? links : [],
+    fallbackUrl || careerUrl,
+    60
+  );
+  return bestCareerLink || fallbackUrl;
+}
+
 function parseQueueItem(value) {
   if (!value || typeof value !== "string") {
     return { url: value };
@@ -1614,6 +1759,8 @@ function buildCareerLinksSuccessUpdate(
   const textFilteredLinkCount = Number(analysis.textFilteredLinkCount || 0);
   const careerFilteredLinkCount = Number(analysis.careerFilteredLinkCount || 0);
   const atsFilteredLinkCount = Number(analysis.atsFilteredLinkCount || 0);
+  const finalCareerUrl = resolveFinalCareerUrl(careerUrl, finalUrl, links, atsLinks);
+  const atsTemplate = detectAtsTemplateFromRules(finalCareerUrl);
   const jobLinksStatus = hasJobLinks ? "job_links_found" : "no_job_links";
   const careerLinksStatus = resolveCareerLinksStatus({
     hasJobDetailLinks,
@@ -1652,6 +1799,8 @@ function buildCareerLinksSuccessUpdate(
       redirectCount,
       redirected,
       finalUrl: finalUrl || careerUrl,
+      finalCareerUrl: finalCareerUrl || finalUrl || careerUrl,
+      atsTemplate,
       pageTitle,
       crawlStatus: "success",
       source,
@@ -1700,6 +1849,7 @@ function buildCareerLinksExcludedUpdate(
     Boolean(options.redirected) ||
     redirectCount > 0 ||
     normalizeLink(finalUrl) !== normalizeLink(careerUrl);
+  const finalCareerUrl = resolveFinalCareerUrl(careerUrl, finalUrl, [], []);
   return {
     $set: {
       careerUrl,
@@ -1731,6 +1881,8 @@ function buildCareerLinksExcludedUpdate(
       redirectCount,
       redirected,
       finalUrl: finalUrl || careerUrl,
+      finalCareerUrl: finalCareerUrl || finalUrl || careerUrl,
+      atsTemplate: detectAtsTemplateFromRules(finalCareerUrl),
       crawlStatus: "success",
       jobLinksStatus: "no_job_links",
       careerLinksStatus: "excluded_domain",
@@ -1775,6 +1927,8 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt, options = {}) 
     Boolean(options.redirected) ||
     redirectCount > 0 ||
     normalizeLink(finalUrl) !== normalizeLink(careerUrl);
+  const finalCareerUrl = resolveFinalCareerUrl(careerUrl, finalUrl, [], []);
+  const atsTemplate = detectAtsTemplateFromRules(finalCareerUrl);
   if (settings.preserveLinksOnError) {
     return {
       $set: {
@@ -1813,6 +1967,8 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt, options = {}) 
         atsCareerLinks: [],
         atsCareerLinkCount: 0,
         hasAtsCareerLinks: false,
+        finalCareerUrl: finalCareerUrl || finalUrl || careerUrl,
+        atsTemplate,
         textFilteredLinkCount: 0,
         careerFilteredLinkCount: 0,
         atsFilteredLinkCount: 0,
@@ -1851,6 +2007,8 @@ function buildCareerLinksErrorUpdate(careerUrl, error, startedAt, options = {}) 
       redirectCount,
       redirected,
       finalUrl: finalUrl || careerUrl,
+      finalCareerUrl: finalCareerUrl || finalUrl || careerUrl,
+      atsTemplate,
       crawlStatus: "error",
       jobLinksStatus: "error",
       careerLinksStatus: "error",

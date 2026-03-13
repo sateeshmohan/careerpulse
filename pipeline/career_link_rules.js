@@ -286,6 +286,36 @@ const ATS_HOSTED_SUBDOMAIN_PATTERNS = [
   "recruitcrm.io",
   "zohorecruit.com"
 ];
+const ATS_TEMPLATE_PATTERN_ALIASES = [
+  {
+    template: "workday",
+    patterns: ["myworkdayjobs.com", "myworkdaysite.com"]
+  },
+  {
+    template: "oracle",
+    patterns: ["oraclecloud.com", "oraclecloudapps.com"]
+  },
+  {
+    template: "adp",
+    patterns: ["workforcenow.adp.com", "adp.com"]
+  },
+  {
+    template: "successfactors",
+    patterns: ["successfactors.com", "successfactors.eu", "successfactors.cn"]
+  },
+  {
+    template: "dayforce",
+    patterns: ["dayforcehcm.com", "dayforce.com", "ceridian.com"]
+  },
+  {
+    template: "personio",
+    patterns: ["personio.com", "personio.de", "personio.io"]
+  },
+  {
+    template: "neogov",
+    patterns: ["neogov.com", "governmentjobs.com"]
+  }
+];
 const HARD_NON_CAREER_PATH_SEGMENTS = new Set([
   "about",
   "aboutus",
@@ -596,6 +626,46 @@ function canonicalizeAtsCareerLink(link) {
     }
   }
   return buildCanonicalUrl(parsed, genericSegments);
+}
+
+function normalizeAtsTemplateName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/^jobs\./, "")
+    .replace(/\.(com|net|org|io|ai|co|hr|us|de|eu|cn)$/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function detectAtsTemplate(link) {
+  if (!link || !isAtsCareerLink(link)) {
+    return "";
+  }
+
+  let host = "";
+  try {
+    host = normalizeHost(new URL(String(link)).hostname);
+  } catch (error) {
+    host = normalizeHost(link);
+  }
+  if (!host) {
+    return "";
+  }
+
+  for (const entry of ATS_TEMPLATE_PATTERN_ALIASES) {
+    if (entry.patterns.some((pattern) => matchesDomain(host, pattern))) {
+      return entry.template;
+    }
+  }
+
+  const matchedPattern = ATS_DOMAIN_PATTERNS.find((pattern) =>
+    matchesDomain(host, pattern)
+  );
+  if (matchedPattern) {
+    return normalizeAtsTemplateName(matchedPattern);
+  }
+
+  return normalizeAtsTemplateName(host);
 }
 
 function hasStrongJobSignal(link) {
@@ -1142,6 +1212,7 @@ function filterLinksByAnchorText(links, linkEntries, options = {}) {
 
 module.exports = {
   canonicalizeAtsCareerLink,
+  detectAtsTemplate,
   detectExpiredOrNoJobs,
   excludedDomainPatterns,
   extractAtsCareerLinks: (links) =>
