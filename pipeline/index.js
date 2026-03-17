@@ -3,7 +3,6 @@ const path = require("path");
 const { URL } = require("url");
 const config = require("config");
 
-const { fetchHtmlWithGot } = require("./http_client");
 const {
   extractLinkEntriesFromHtml,
   extractPageTextSampleFromHtml
@@ -105,7 +104,7 @@ const parseBoolean = (value, fallback) => {
 
 function parseFetchMode(value, fallback = "auto") {
   const normalized = String(value || fallback).toLowerCase();
-  if (normalized === "puppeteer" || normalized === "got" || normalized === "auto") {
+  if (normalized === "puppeteer" || normalized === "auto") {
     return normalized;
   }
   return fallback;
@@ -2246,129 +2245,44 @@ function normalizeFetchedLinksResult(result, fallbackUrl = "") {
 }
 
 async function fetchCareerLinks(url) {
-  const buildGotLinksResult = (gotResult) => {
-    const rawLinkEntries = extractLinkEntriesFromHtml(gotResult.html, url, {
-      sameDomainOnly: false
-    });
-    const linkEntries = dedupeLinkEntriesPreferHttps(rawLinkEntries);
-    const links = dedupeLinksPreferHttps(
-      linkEntries.map((entry) => entry.url).filter(Boolean)
-    );
-    const pageSignals = extractPageTextSampleFromHtml(gotResult.html, {
-      maxLength: settings.expireDetectionTextLimit
-    });
-    return {
-      links,
-      linkEntries,
-      source: "got",
-      userAgent: gotResult.userAgent,
-      statusCode: gotResult.statusCode || 0,
-      finalUrl: normalizeLink(gotResult.finalUrl || url) || gotResult.finalUrl || url,
-      redirectChain: Array.isArray(gotResult.redirectChain)
-        ? gotResult.redirectChain
-        : [],
-      redirectStatusCodes: Array.isArray(gotResult.redirectStatusCodes)
-        ? gotResult.redirectStatusCodes
-        : [],
-      redirectCount: Number(gotResult.redirectCount || 0),
-      redirected: Boolean(gotResult.redirected),
-      pageTitle: pageSignals.title || "",
-      pageTextSample: pageSignals.textSample || ""
-    };
-  };
-
-  if (settings.linksFetchMode === "puppeteer") {
+  const fetchWithPuppeteer = async () => {
     const puppeteerResult = await fetchLinksWithPuppeteer(url, {
       timeoutMs: settings.puppeteerTimeoutMs,
       pageTextLimit: settings.expireDetectionTextLimit
     });
     return normalizeFetchedLinksResult(
       {
-      ...puppeteerResult,
-      finalUrl: puppeteerResult.finalUrl || url
+        ...puppeteerResult,
+        finalUrl: puppeteerResult.finalUrl || url
       },
       url
     );
-  }
+  };
 
   if (settings.linksFetchMode === "got") {
-    const gotResult = await fetchHtmlWithGot(url, {
-      timeoutMs: settings.gotTimeoutMs
-    });
-    return normalizeFetchedLinksResult(buildGotLinksResult(gotResult), url);
-  }
-
-  let gotResult = null;
-  try {
-    gotResult = await fetchHtmlWithGot(url, {
-      timeoutMs: settings.gotTimeoutMs
-    });
-    const gotLinksResult = buildGotLinksResult(gotResult);
-    const links = gotLinksResult.links;
-    const likelyJobLinks = filterJobLinks(links, {
-      strongPatterns: settings.jobLinkStrongPatterns,
-      weakPatterns: settings.jobLinkWeakPatterns,
-      excludePatterns: settings.jobLinkExcludePatterns
-    });
-    const hasEnoughLikelyJobs =
-      settings.minLikelyJobLinksForGot <= 0 ||
-      likelyJobLinks.length >= settings.minLikelyJobLinksForGot;
-    if (Number(gotLinksResult.statusCode || 0) >= 400) {
-      return normalizeFetchedLinksResult(gotLinksResult, url);
-    }
-    if (links.length >= settings.minLinksForGot && hasEnoughLikelyJobs) {
-      return normalizeFetchedLinksResult(gotLinksResult, url);
-    }
-    log("Got did not meet link quality threshold, falling back to puppeteer.", {
-      url,
-      count: links.length,
-      likelyJobLinkCount: likelyJobLinks.length,
-      minLinksForGot: settings.minLinksForGot,
-      minLikelyJobLinksForGot: settings.minLikelyJobLinksForGot
-    });
-  } catch (error) {
-    log("Got failed, falling back to puppeteer.", {
-      url,
-      error: error.toString()
+    log("links_fetch_mode got is deprecated; switching to puppeteer for this call.", {
+      url
     });
   }
 
-  const puppeteerResult = await fetchLinksWithPuppeteer(url, {
-    timeoutMs: settings.puppeteerTimeoutMs,
-    pageTextLimit: settings.expireDetectionTextLimit
-  });
-  const normalizedPuppeteerResult = normalizeFetchedLinksResult(
-    {
-      ...puppeteerResult,
-      finalUrl: puppeteerResult.finalUrl || url
-    },
-    url
-  );
-  const initialLinks = Array.isArray(normalizedPuppeteerResult.links)
-    ? normalizedPuppeteerResult.links
+  const initialResult = await fetchWithPuppeteer();
+  const initialLinks = Array.isArray(initialResult.links)
+    ? initialResult.links
     : [];
   const initialLikelyJobLinks = filterJobLinks(initialLinks, {
     strongPatterns: settings.jobLinkStrongPatterns,
     weakPatterns: settings.jobLinkWeakPatterns,
     excludePatterns: settings.jobLinkExcludePatterns
   }).length;
+
   if (initialLinks.length > 1 && initialLikelyJobLinks > 0) {
-    return normalizedPuppeteerResult;
+    return initialResult;
   }
+
   try {
-    const retryResult = await fetchLinksWithPuppeteer(url, {
-      timeoutMs: settings.puppeteerTimeoutMs,
-      pageTextLimit: settings.expireDetectionTextLimit
-    });
-    const normalizedRetryResult = normalizeFetchedLinksResult(
-      {
-        ...retryResult,
-        finalUrl: retryResult.finalUrl || url
-      },
-      url
-    );
-    const retryLinks = Array.isArray(normalizedRetryResult.links)
-      ? normalizedRetryResult.links
+    const retryResult = await fetchWithPuppeteer();
+    const retryLinks = Array.isArray(retryResult.links)
+      ? retryResult.links
       : [];
     const retryLikelyJobLinks = filterJobLinks(retryLinks, {
       strongPatterns: settings.jobLinkStrongPatterns,
@@ -2387,7 +2301,7 @@ async function fetchCareerLinks(url) {
         initialLikelyJobLinks,
         retryLikelyJobLinks
       });
-      return normalizedRetryResult;
+      return retryResult;
     }
   } catch (error) {
     log("Puppeteer retry failed.", {
@@ -2395,43 +2309,13 @@ async function fetchCareerLinks(url) {
       error: error.toString()
     });
   }
-  return normalizedPuppeteerResult;
+  return initialResult;
 }
 
 async function fetchPageHtml(url) {
-  try {
-    const gotResult = await fetchHtmlWithGot(url, {
-      timeoutMs: settings.gotTimeoutMs
-    });
-    const htmlLength = gotResult.html ? gotResult.html.length : 0;
-    if (!gotResult.html) {
-      throw new Error("Got returned empty html body.");
-    }
-    if (
-      htmlLength >= settings.minHtmlLength ||
-      !settings.fallBackToPuppeteerOnShortHtml
-    ) {
-      return {
-        html: gotResult.html,
-        source: "got",
-        userAgent: gotResult.userAgent
-      };
-    }
-    log("Got returned short html, falling back to puppeteer.", {
-      url,
-      length: htmlLength
-    });
-  } catch (error) {
-    log("Got failed for html fetch, falling back to puppeteer.", {
-      url,
-      error: error.toString()
-    });
-  }
-
-  const puppeteerResult = await fetchHtmlWithPuppeteer(url, {
+  return fetchHtmlWithPuppeteer(url, {
     timeoutMs: settings.puppeteerTimeoutMs
   });
-  return puppeteerResult;
 }
 
 async function seedFromFile(redisClient, filePath) {
